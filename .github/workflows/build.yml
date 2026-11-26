@@ -1,0 +1,273 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate project files
+        run: |
+          cat > settings.gradle.kts << 'KBEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SmartKeyboard"
+          include(":app")
+          KBEOF
+          cat > build.gradle.kts << 'KBEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KBEOF
+          cat > gradle.properties << 'KBEOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          KBEOF
+          mkdir -p app
+          cat > app/build.gradle.kts << 'KBEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.mohsenm.smartkeyboard"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.mohsenm.smartkeyboard"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              // فعلاً وابستگی لازم نیست؛ بعداً Room و ... اضافه می‌شود
+          }
+          KBEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'KBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <!-- عمداً پرمیشن INTERNET نداریم: داده‌ها از گوشی خارج نمی‌شوند -->
+              <application
+                  android:label="@string/app_name"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
+
+                  <service
+                      android:name=".SmartKeyboardService"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_INPUT_METHOD"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.view.im"
+                          android:resource="@xml/method" />
+                  </service>
+              </application>
+          </manifest>
+          KBEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/method.xml << 'KBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android">
+              <subtype
+                  android:label="فارسی"
+                  android:imeSubtypeLocale="fa_IR"
+                  android:imeSubtypeMode="keyboard" />
+          </input-method>
+          KBEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml << 'KBEOF'
+          <resources>
+              <string name="app_name">کیبورد هوشمند</string>
+          </resources>
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/SmartKeyboardService.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          import android.inputmethodservice.InputMethodService
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class SmartKeyboardService : InputMethodService() {
+
+              private var learningEnabled = true
+              private lateinit var suggestionBar: LinearLayout
+
+              private val letterRows = listOf(
+                  "ضصثقفغعهخحجچ",
+                  "شسیبلاتنمکگ",
+                  "ظطزرذدپو"
+              )
+
+              override fun onCreateInputView(): View {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(0xFF263238.toInt())
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+
+                  // نوار پیشنهاد
+                  suggestionBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                      minimumHeight = dp(40)
+                  }
+                  root.addView(suggestionBar)
+
+                  // ردیف حروف
+                  letterRows.forEach { row ->
+                      val line = newRow()
+                      row.forEach { ch -> line.addView(key(ch.toString()) { type(ch.toString()) }) }
+                      root.addView(line)
+                  }
+
+                  // ردیف پایین: نیم‌فاصله، فاصله، پاک‌کردن، اینتر
+                  val bottom = newRow()
+                  bottom.addView(key("‌⎵") { type("\u200c") }, weight(1f))      // نیم‌فاصله (ZWNJ)
+                  bottom.addView(key("فاصله") { type(" ") }, weight(4f))
+                  bottom.addView(key("⌫") { backspace() }, weight(1.5f))
+                  bottom.addView(key("↵") { enter() }, weight(1.5f))
+                  root.addView(bottom)
+
+                  return root
+              }
+
+              override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+                  super.onStartInputView(info, restarting)
+                  // در فیلد رمز عبور و فیلدهای حساس یادگیری خاموش است
+                  learningEnabled = !isSensitiveField(info)
+                  updateSuggestions()
+              }
+
+              private fun isSensitiveField(info: EditorInfo?): Boolean {
+                  val type = info?.inputType ?: return true
+                  val cls = type and InputType.TYPE_MASK_CLASS
+                  val variation = type and InputType.TYPE_MASK_VARIATION
+                  return when (cls) {
+                      InputType.TYPE_CLASS_TEXT ->
+                          variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                          variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                          variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD
+                      InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                      else -> false
+                  }
+              }
+
+              // ---- ورودی ----
+              private fun type(text: String) {
+                  currentInputConnection?.commitText(text, 1)
+                  updateSuggestions()
+              }
+
+              private fun backspace() {
+                  currentInputConnection?.deleteSurroundingText(1, 0)
+                  updateSuggestions()
+              }
+
+              private fun enter() {
+                  currentInputConnection?.apply {
+                      sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
+                      sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+                  }
+              }
+
+              // ---- پیشنهادها ----
+              private fun updateSuggestions() {
+                  val before = currentInputConnection?.getTextBeforeCursor(30, 0)?.toString().orEmpty()
+                  val items = suggest(before)
+                  suggestionBar.removeAllViews()
+                  items.forEach { s ->
+                      suggestionBar.addView(TextView(this).apply {
+                          text = s
+                          setTextColor(0xFFFFFFFF.toInt())
+                          textSize = 16f
+                          gravity = Gravity.CENTER
+                          setPadding(dp(12), 0, dp(12), 0)
+                          setOnClickListener { type(s) }
+                      }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+                  }
+              }
+
+              // TODO مرحله‌ی بعد: اتصال به Trie/Room برای عبارت‌های پرتکرار
+              private fun suggest(textBeforeCursor: String): List<String> = emptyList()
+
+              // ---- ابزارهای UI ----
+              private fun newRow() = LinearLayout(this).apply {
+                  orientation = LinearLayout.HORIZONTAL
+                  layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  layoutParams = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, dp(48)
+                  )
+              }
+
+              private fun key(label: String, onClick: () -> Unit) = Button(this).apply {
+                  text = label
+                  isAllCaps = false
+                  setOnClickListener { onClick() }
+              }
+
+              private fun weight(w: Float) =
+                  LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, w)
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+          }
+          KBEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smart-keyboard-apk
+          path: app/build/outputs/apk/debug/*.apk
