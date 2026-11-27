@@ -186,12 +186,13 @@ jobs:
           import android.database.sqlite.SQLiteOpenHelper
 
           /** جمله‌های ذخیره‌شده، کلیپ‌بورد و گاوصندوق؛ فقط روی همین گوشی نگهداری می‌شود. */
-          class PhraseStore(context: Context) : SQLiteOpenHelper(context, "phrases.db", null, 4) {
+          class PhraseStore(context: Context) : SQLiteOpenHelper(context, "phrases.db", null, 5) {
 
               override fun onCreate(db: SQLiteDatabase) {
                   createPhrases(db)
                   createVault(db)
                   createClips(db)
+                  createLearning(db)
               }
 
               override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -207,6 +208,18 @@ jobs:
                       // پین‌کردن موارد کلیپ‌بورد
                       db.execSQL("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
                   }
+                  if (oldVersion < 5) {
+                      createLearning(db)
+                  }
+              }
+
+              private fun createLearning(db: SQLiteDatabase) {
+                  db.execSQL("CREATE TABLE IF NOT EXISTS words (w TEXT PRIMARY KEY, cnt INTEGER NOT NULL, last INTEGER NOT NULL)")
+                  db.execSQL(
+                      "CREATE TABLE IF NOT EXISTS bigrams (prev TEXT NOT NULL, next TEXT NOT NULL, " +
+                          "cnt INTEGER NOT NULL, last INTEGER NOT NULL, PRIMARY KEY(prev, next))"
+                  )
+                  db.execSQL("CREATE TABLE IF NOT EXISTS sentences (text TEXT PRIMARY KEY, cnt INTEGER NOT NULL, last INTEGER NOT NULL)")
               }
 
               private fun createPhrases(db: SQLiteDatabase) = db.execSQL(
@@ -326,6 +339,92 @@ jobs:
                   writableDatabase.execSQL("DELETE FROM clips WHERE pinned = 0")
               }
 
+              // ---------- یادگیری از نوشته‌های کاربر (فقط روی همین گوشی) ----------
+
+              private fun likeEscape(s: String) = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+              fun learnWord(w: String) {
+                  val now = System.currentTimeMillis()
+                  val db = writableDatabase
+                  db.execSQL("INSERT OR IGNORE INTO words(w, cnt, last) VALUES(?, 0, ?)", arrayOf<Any>(w, now))
+                  db.execSQL("UPDATE words SET cnt = cnt + 1, last = ? WHERE w = ?", arrayOf<Any>(now, w))
+              }
+
+              fun learnBigram(prev: String, next: String) {
+                  val now = System.currentTimeMillis()
+                  val db = writableDatabase
+                  db.execSQL("INSERT OR IGNORE INTO bigrams(prev, next, cnt, last) VALUES(?, ?, 0, ?)", arrayOf<Any>(prev, next, now))
+                  db.execSQL("UPDATE bigrams SET cnt = cnt + 1, last = ? WHERE prev = ? AND next = ?", arrayOf<Any>(now, prev, next))
+              }
+
+              /** تعداد دفعاتی که این جمله نوشته شده (پس از ثبت این بار) */
+              fun learnSentence(text: String): Int {
+                  val now = System.currentTimeMillis()
+                  val db = writableDatabase
+                  db.execSQL("INSERT OR IGNORE INTO sentences(text, cnt, last) VALUES(?, 0, ?)", arrayOf<Any>(text, now))
+                  db.execSQL("UPDATE sentences SET cnt = cnt + 1, last = ? WHERE text = ?", arrayOf<Any>(now, text))
+                  db.rawQuery("SELECT cnt FROM sentences WHERE text = ?", arrayOf(text)).use { c ->
+                      if (c.moveToFirst()) return c.getInt(0)
+                  }
+                  return 0
+              }
+
+              /** تکمیل کلمه: فقط کلمه‌هایی که دست‌کم دو بار نوشته شده‌اند (تا غلط‌های تایپی پیشنهاد نشوند) */
+              fun suggestWords(prefix: String, limit: Int): List<String> {
+                  val out = ArrayList<String>()
+                  readableDatabase.rawQuery(
+                      "SELECT w FROM words WHERE cnt >= 2 AND w LIKE ? ESCAPE '\\' AND w != ? " +
+                          "ORDER BY cnt DESC, last DESC LIMIT ?",
+                      arrayOf(likeEscape(prefix) + "%", prefix, limit.toString())
+                  ).use { c -> while (c.moveToNext()) out.add(c.getString(0)) }
+                  return out
+              }
+
+              /** کلمه‌ی بعدی محتمل، بر اساس کلمه‌ی قبلی */
+              fun nextWords(prev: String, limit: Int): List<String> {
+                  val out = ArrayList<String>()
+                  readableDatabase.rawQuery(
+                      "SELECT next FROM bigrams WHERE prev = ? AND cnt >= 2 ORDER BY cnt DESC, last DESC LIMIT ?",
+                      arrayOf(prev, limit.toString())
+                  ).use { c -> while (c.moveToNext()) out.add(c.getString(0)) }
+                  return out
+              }
+
+              /** پرکاربردترین کلمه‌های کاربر؛ برای سوایپ هم به فرهنگ لغت اضافه می‌شوند */
+              fun topWords(limit: Int): List<String> {
+                  val out = ArrayList<String>()
+                  readableDatabase.rawQuery(
+                      "SELECT w FROM words WHERE cnt >= 2 ORDER BY cnt DESC, last DESC LIMIT ?",
+                      arrayOf(limit.toString())
+                  ).use { c -> while (c.moveToNext()) out.add(c.getString(0)) }
+                  return out
+              }
+
+              fun wordCount(): Int {
+                  readableDatabase.rawQuery("SELECT COUNT(*) FROM words WHERE cnt >= 2", null).use { c ->
+                      if (c.moveToFirst()) return c.getInt(0)
+                  }
+                  return 0
+              }
+
+              /** نگه‌داشتن اندازه‌ی داده‌ها: غلط‌های تایپی قدیمی و موارد کم‌اهمیت پاک می‌شوند. */
+              fun pruneLearning() {
+                  val db = writableDatabase
+                  val old = System.currentTimeMillis() - 30L * 24 * 3_600_000
+                  db.execSQL("DELETE FROM words WHERE cnt < 2 AND last < ?", arrayOf<Any>(old))
+                  db.execSQL("DELETE FROM words WHERE w NOT IN (SELECT w FROM words ORDER BY cnt DESC, last DESC LIMIT 5000)")
+                  db.execSQL("DELETE FROM bigrams WHERE cnt < 2 AND last < ?", arrayOf<Any>(old))
+                  db.execSQL("DELETE FROM bigrams WHERE rowid NOT IN (SELECT rowid FROM bigrams ORDER BY cnt DESC, last DESC LIMIT 8000)")
+                  db.execSQL("DELETE FROM sentences WHERE cnt < 3 AND last < ?", arrayOf<Any>(old))
+              }
+
+              fun clearLearning() {
+                  val db = writableDatabase
+                  db.execSQL("DELETE FROM words")
+                  db.execSQL("DELETE FROM bigrams")
+                  db.execSQL("DELETE FROM sentences")
+              }
+
               // ---------- گاوصندوق (رمزگذاری‌شده) ----------
 
               fun vaultAdd(label: String, secret: String) {
@@ -391,7 +490,7 @@ jobs:
               var onSwipe: ((List<PointF>, List<Pair<Char, RectF>>) -> Unit)? = null
 
               private val density = resources.displayMetrics.density
-              private val slop = 16f * density
+              private val slop = 40f * density
 
               private val path = ArrayList<PointF>()
               private var swiping = false
@@ -648,7 +747,14 @@ jobs:
                   val keyW = wSum / keys.size
 
                   val userLen = pathLength(path)
-                  if (userLen < keyW * 0.8f) return emptyList()
+                  if (userLen < keyW * 2.5f) return emptyList()
+
+                  // مسیر باید دست‌کم از ۳ کلید مختلف عبور کند؛ وگرنه لغزش انگشت هنگام تایپ است
+                  val visited = HashSet<Char>()
+                  for (pt in path) {
+                      for ((c, r) in keys) if (r.contains(pt.x, pt.y)) { visited.add(c); break }
+                  }
+                  if (visited.size < 3) return emptyList()
                   val user = resample(path, N)
 
                   fun nearest(p: PointF): Set<Char> =
@@ -894,6 +1000,7 @@ jobs:
                   searchQuery = ""
                   selectMode = false
                   store.clipExpire(KbSettings.clipTtlHours(this))
+                  pruneIfNeeded()
                   captureClip()
                   handler.removeCallbacks(clipPoll)
                   handler.postDelayed(clipPoll, 1500)
@@ -1055,6 +1162,9 @@ jobs:
                   if (searchMode) { searchQuery += text; updateSuggestions(); return }
                   swipeChips = emptyList()
                   currentInputConnection?.commitText(normalizeDigits(text), 1)
+                  if (text.length == 1 && isDelim(text[0])) {
+                      learnFromContext(SENTENCE_END.indexOf(text[0]) >= 0, true)
+                  }
                   updateSuggestions()
               }
 
@@ -1073,11 +1183,76 @@ jobs:
 
               private fun enter() {
                   if (searchMode) { exitSearch(); return }
+                  learnFromContext(true, false)
                   swipeChips = emptyList()
                   currentInputConnection?.apply {
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
                   }
+                  updateSuggestions()
+              }
+
+              // ---- یادگیری کلمه‌ها و جمله‌های کاربر ----
+              private class Sug(val text: String, val onClick: () -> Unit)
+
+              private val TOKEN_SPLIT = Regex("[^\\p{L}\\u200c]+")
+              private var lastPrune = 0L
+
+              private fun cleanWord(raw: String): String? {
+                  val w = raw.trim('\u200c').replace('ي', 'ی').replace('ك', 'ک').lowercase()
+                  if (w.length < 2 || w.length > 24) return null
+                  for (ch in w) if (!(ch.isLetter() || ch == '\u200c')) return null
+                  return w
+              }
+
+              private fun isDelim(c: Char) = " .،,؟?!؛;:".indexOf(c) >= 0
+
+              /**
+               * بعد از نوشتن یک جداکننده (فاصله، نقطه، اینتر...) آخرین کلمه، ترکیب «کلمه‌ی قبلی ← این کلمه»
+               * و در پایان جمله، خود جمله را یاد می‌گیرد.
+               */
+              private fun learnFromContext(sentenceEnded: Boolean, delimCommitted: Boolean) {
+                  if (!learningEnabled || !KbSettings.learn(this)) return
+                  try {
+                      val ic = currentInputConnection ?: return
+                      val before = ic.getTextBeforeCursor(200, 0)?.toString() ?: return
+                      val body = if (delimCommitted) before.dropLast(1) else before
+                      if (body.isEmpty() || !body.last().isLetter()) return
+                      val seg = currentSegment(body)
+                      val tokens = seg.split(TOKEN_SPLIT).filter { it.isNotEmpty() }
+                      val last = cleanWord(tokens.lastOrNull() ?: return) ?: return
+                      store.learnWord(last)
+                      val prev = if (tokens.size >= 2) cleanWord(tokens[tokens.size - 2]) else null
+                      if (prev != null) store.learnBigram(prev, last)
+                      val truncated = body.length >= 200 && seg.length == body.length
+                      if (sentenceEnded && !truncated) learnSentence(seg)
+                  } catch (e: Exception) {
+                      // یادگیری مهم‌تر از خطا نیست؛ نادیده گرفته می‌شود
+                  }
+              }
+
+              /** جمله‌ای که ۳ بار نوشته شود، خودکار به جمله‌های ذخیره‌شده اضافه می‌شود. */
+              private fun learnSentence(raw: String) {
+                  val t = normalizeDigits(raw).trim().replace(Regex("\\s+"), " ")
+                  if (t.length < 6 || t.length > 120) return
+                  if (t.split(" ").size < 2) return
+                  if (LONG_DIGITS.containsMatchIn(t)) return
+                  if (store.learnSentence(t) >= 3) store.add(t)
+              }
+
+              private fun pruneIfNeeded() {
+                  val now = System.currentTimeMillis()
+                  if (now - lastPrune < 6 * 3_600_000L) return
+                  lastPrune = now
+                  try { store.pruneLearning() } catch (e: Exception) { }
+              }
+
+              private fun applyWord(partialLen: Int, w: String) {
+                  val ic = currentInputConnection ?: return
+                  swipeChips = emptyList()
+                  if (partialLen > 0) ic.deleteSurroundingText(partialLen, 0)
+                  ic.commitText("$w ", 1)
+                  learnFromContext(false, true)
                   updateSuggestions()
               }
 
@@ -1314,11 +1489,29 @@ jobs:
                       if (r.isNotEmpty()) { raw = cand; found = r; break }
                   }
 
-                  if (found.isEmpty()) { addToolbar(); return }
+                  // پیشنهاد کلمه: تکمیل کلمه‌ی نیمه‌کاره، یا کلمه‌ی بعدی بعد از فاصله
+                  val phrases = found.map { s -> Sug(s) { applySuggestion(raw, s) } }
+                  val wordSugs = ArrayList<Sug>()
+                  if (KbSettings.learn(this)) {
+                      val tail = before.takeLastWhile { it.isLetter() || it == '\u200c' }
+                      if (tail.length >= 2) {
+                          store.suggestWords(tail, 3).forEach { w -> wordSugs.add(Sug(w) { applyWord(tail.length, w) }) }
+                      } else if (tail.isEmpty() && before.endsWith(" ") && !before.endsWith("  ")) {
+                          val prev = currentSegment(before).split(TOKEN_SPLIT).filter { it.isNotEmpty() }
+                              .lastOrNull()?.let { cleanWord(it) }
+                          if (prev != null) store.nextWords(prev, 3).forEach { w -> wordSugs.add(Sug(w) { applyWord(0, w) }) }
+                      }
+                  }
+                  val sugs = ArrayList<Sug>()
+                  sugs.addAll(phrases.take(2))
+                  wordSugs.filter { w -> sugs.none { it.text == w.text } }.take(3 - sugs.size).forEach { sugs.add(it) }
+                  if (sugs.size < 3) sugs.addAll(phrases.drop(2).take(3 - sugs.size))
 
-                  found.forEach { s ->
+                  if (sugs.isEmpty()) { addToolbar(); return }
+
+                  sugs.forEach { sg ->
                       suggestionBar.addView(TextView(this).apply {
-                          text = s
+                          text = sg.text
                           setTextColor(cText)
                           background = roundBg(cKey)
                           textSize = 15f
@@ -1326,7 +1519,7 @@ jobs:
                           maxLines = 1
                           ellipsize = TextUtils.TruncateAt.END
                           setPadding(dp(8), 0, dp(8), 0)
-                          setOnClickListener { applySuggestion(raw, s) }
+                          setOnClickListener { sg.onClick() }
                       }, weight(1f))
                   }
               }
@@ -1695,7 +1888,7 @@ jobs:
               // ---- سوایپ ----
               private fun handleSwipe(path: List<PointF>, keys: List<Pair<Char, RectF>>) {
                   val language = lang
-                  val extra = store.all()
+                  val extra = store.all() + store.topWords(3000)
                   executor.execute {
                       val words = try {
                           decoder.decode(language, path, keys, extra)
@@ -1717,6 +1910,7 @@ jobs:
                   val prefix = if (prev.isNotEmpty() && !prev[0].isWhitespace()) " " else ""
 
                   ic.commitText(prefix + list[0] + " ", 1)
+                  learnFromContext(false, true)
                   swipeCommitted = list[0]
                   swipeChips = list
                   updateSuggestions()
@@ -1908,6 +2102,10 @@ jobs:
 
               fun sound(c: Context) = prefs(c).getBoolean("snd", false)
               fun setSound(c: Context, v: Boolean) = prefs(c).edit().putBoolean("snd", v).apply()
+
+              /** یادگیری کلمه‌ها و جمله‌های پرکاربرد کاربر */
+              fun learn(c: Context) = prefs(c).getBoolean("learn", true)
+              fun setLearn(c: Context, v: Boolean) = prefs(c).edit().putBoolean("learn", v).apply()
 
               fun swipe(c: Context) = prefs(c).getBoolean("swipe", true)
               fun setSwipe(c: Context, v: Boolean) = prefs(c).edit().putBoolean("swipe", v).apply()
@@ -2371,6 +2569,35 @@ jobs:
                       addView(choiceRow(KbSettings.HAND_LABELS, KbSettings.oneHand(this@SettingsActivity)) {
                           KbSettings.setOneHand(this@SettingsActivity, it)
                       })
+                  }
+
+                  // ---- یادگیری ----
+                  section("یادگیری از نوشته‌های من")
+                  card {
+                      addView(switchRow("یادگیری کلمه‌ها و جمله‌های پرکاربرد", KbSettings.learn(this@SettingsActivity)) {
+                          KbSettings.setLearn(this@SettingsActivity, it)
+                      })
+                      addView(TextView(this@SettingsActivity).apply {
+                          text = "کلمه‌های تکراری شما به پیشنهادها و تایپ سوایپی اضافه می‌شوند و جمله‌ای که ۳ بار بنویسید خودکار ذخیره می‌شود. " +
+                              "همه‌چیز فقط روی همین گوشی می‌ماند و در فیلد رمز عبور چیزی یاد گرفته نمی‌شود."
+                          setTextColor(cHint)
+                          textSize = 12f
+                          setPadding(dp(4), dp(2), dp(4), dp(6))
+                      })
+                      val n = try { PhraseStore(this@SettingsActivity).wordCount() } catch (e: Exception) { 0 }
+                      addView(label("کلمه‌های یادگرفته‌شده: $n"))
+                      var armed = false
+                      val clear = actionButton("پاک‌کردن چیزهایی که یاد گرفته") {}
+                      clear.setOnClickListener {
+                          if (!armed) {
+                              armed = true
+                              clear.text = "مطمئنی؟ برای تأیید دوباره بزن"
+                          } else {
+                              PhraseStore(this@SettingsActivity).clearLearning()
+                              build()
+                          }
+                      }
+                      addView(clear)
                   }
 
                   // ---- کلیپ‌بورد ----
