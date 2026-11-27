@@ -58,8 +58,8 @@ jobs:
                   applicationId = "com.mohsenm.smartkeyboard"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "0.1"
+                  versionCode = 2
+                  versionName = "0.2"
               }
 
               compileOptions {
@@ -80,10 +80,22 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <!-- عمداً پرمیشن INTERNET نداریم: داده‌ها از گوشی خارج نمی‌شوند -->
+              <uses-permission android:name="android.permission.VIBRATE" />
               <application
                   android:label="@string/app_name"
                   android:allowBackup="false"
                   android:supportsRtl="true">
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:label="@string/app_name"
+                      android:theme="@android:style/Theme.Material.NoActionBar"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
 
                   <service
                       android:name=".SmartKeyboardService"
@@ -103,7 +115,8 @@ jobs:
           mkdir -p app/src/main/res/xml
           cat > app/src/main/res/xml/method.xml << 'KBEOF'
           <?xml version="1.0" encoding="utf-8"?>
-          <input-method xmlns:android="http://schemas.android.com/apk/res/android">
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android"
+              android:settingsActivity="com.mohsenm.smartkeyboard.SettingsActivity">
               <subtype
                   android:label="فارسی"
                   android:imeSubtypeLocale="fa_IR"
@@ -173,7 +186,7 @@ jobs:
           import android.database.sqlite.SQLiteOpenHelper
 
           /** جمله‌های ذخیره‌شده، کلیپ‌بورد و گاوصندوق؛ فقط روی همین گوشی نگهداری می‌شود. */
-          class PhraseStore(context: Context) : SQLiteOpenHelper(context, "phrases.db", null, 3) {
+          class PhraseStore(context: Context) : SQLiteOpenHelper(context, "phrases.db", null, 4) {
 
               override fun onCreate(db: SQLiteDatabase) {
                   createPhrases(db)
@@ -190,6 +203,10 @@ jobs:
                       createVault(db)
                       createClips(db)
                   }
+                  if (oldVersion == 3) {
+                      // پین‌کردن موارد کلیپ‌بورد
+                      db.execSQL("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+                  }
               }
 
               private fun createPhrases(db: SQLiteDatabase) = db.execSQL(
@@ -202,7 +219,7 @@ jobs:
               )
 
               private fun createClips(db: SQLiteDatabase) = db.execSQL(
-                  "CREATE TABLE IF NOT EXISTS clips (text TEXT PRIMARY KEY, ts INTEGER NOT NULL)"
+                  "CREATE TABLE IF NOT EXISTS clips (text TEXT PRIMARY KEY, ts INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0)"
               )
 
               // ---------- جمله‌های ذخیره‌شده ----------
@@ -260,32 +277,53 @@ jobs:
 
               // ---------- کلیپ‌بورد ----------
 
-              fun clipAdd(text: String) {
+              /** کپی جدید را اضافه می‌کند (اگر قبلاً بوده، فقط زمانش تازه می‌شود و پینش حفظ می‌شود). */
+              fun clipAdd(text: String, ttlHours: Int = 0) {
                   val db = writableDatabase
+                  val now = System.currentTimeMillis()
+                  db.execSQL("INSERT OR IGNORE INTO clips(text, ts, pinned) VALUES(?, ?, 0)", arrayOf<Any>(text, now))
+                  db.execSQL("UPDATE clips SET ts = ? WHERE text = ?", arrayOf<Any>(now, text))
+                  // از موارد پین‌نشده فقط ۳۰ مورد آخر نگه داشته می‌شود
                   db.execSQL(
-                      "INSERT OR REPLACE INTO clips(text, ts) VALUES(?, ?)",
-                      arrayOf<Any>(text, System.currentTimeMillis())
+                      "DELETE FROM clips WHERE pinned = 0 AND text NOT IN " +
+                          "(SELECT text FROM clips WHERE pinned = 0 ORDER BY ts DESC LIMIT 30)"
                   )
-                  // فقط ۳۰ مورد آخر نگه داشته می‌شود
-                  db.execSQL(
-                      "DELETE FROM clips WHERE text NOT IN (SELECT text FROM clips ORDER BY ts DESC LIMIT 30)"
-                  )
+                  clipExpire(ttlHours)
               }
 
-              fun clipList(): List<String> {
-                  val out = ArrayList<String>()
-                  readableDatabase.rawQuery("SELECT text FROM clips ORDER BY ts DESC", null).use { c ->
-                      while (c.moveToNext()) out.add(c.getString(0))
+              /** موارد پین‌نشده‌ای که از ttlHours ساعت گذشته‌اند پاک می‌شوند (0 = هرگز). */
+              fun clipExpire(ttlHours: Int) {
+                  if (ttlHours <= 0) return
+                  val limit = System.currentTimeMillis() - ttlHours * 3_600_000L
+                  writableDatabase.execSQL("DELETE FROM clips WHERE pinned = 0 AND ts < ?", arrayOf<Any>(limit))
+              }
+
+              /** فهرست (متن، پین‌شده؟)؛ پین‌شده‌ها اول می‌آیند. */
+              fun clipItems(): List<Pair<String, Boolean>> {
+                  val out = ArrayList<Pair<String, Boolean>>()
+                  readableDatabase.rawQuery(
+                      "SELECT text, pinned FROM clips ORDER BY pinned DESC, ts DESC", null
+                  ).use { c ->
+                      while (c.moveToNext()) out.add(Pair(c.getString(0), c.getInt(1) == 1))
                   }
                   return out
+              }
+
+              fun clipList(): List<String> = clipItems().map { it.first }
+
+              fun clipSetPinned(text: String, pinned: Boolean) {
+                  writableDatabase.execSQL(
+                      "UPDATE clips SET pinned = ? WHERE text = ?", arrayOf<Any>(if (pinned) 1 else 0, text)
+                  )
               }
 
               fun clipDelete(text: String) {
                   writableDatabase.execSQL("DELETE FROM clips WHERE text = ?", arrayOf<Any>(text))
               }
 
+              /** همه‌ی موارد پین‌نشده را پاک می‌کند؛ پین‌شده‌ها می‌مانند. */
               fun clipClear() {
-                  writableDatabase.execSQL("DELETE FROM clips")
+                  writableDatabase.execSQL("DELETE FROM clips WHERE pinned = 0")
               }
 
               // ---------- گاوصندوق (رمزگذاری‌شده) ----------
@@ -347,6 +385,9 @@ jobs:
           class SwipeLayout(context: Context) : LinearLayout(context) {
 
               var swipeEnabled = false
+              var trailColor: Int
+                  get() = paint.color
+                  set(v) { paint.color = (v and 0x00FFFFFF) or 0xAA000000.toInt() }
               var onSwipe: ((List<PointF>, List<Pair<Char, RectF>>) -> Unit)? = null
 
               private val density = resources.displayMetrics.density
@@ -660,6 +701,7 @@ jobs:
 
           import android.content.ClipboardManager
           import android.content.Context
+          import android.content.Intent
           import android.content.res.Configuration
           import android.graphics.Color
           import android.graphics.PointF
@@ -667,9 +709,13 @@ jobs:
           import android.graphics.drawable.GradientDrawable
           import android.graphics.drawable.StateListDrawable
           import android.inputmethodservice.InputMethodService
+          import android.media.AudioManager
           import android.os.Build
           import android.os.Handler
           import android.os.Looper
+          import android.os.SystemClock
+          import android.os.VibrationEffect
+          import android.os.Vibrator
           import android.text.InputType
           import android.text.TextUtils
           import android.view.Gravity
@@ -679,6 +725,7 @@ jobs:
           import android.view.inputmethod.EditorInfo
           import android.widget.Button
           import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
@@ -726,6 +773,15 @@ jobs:
               private var shift = false
               private var emojiCat = 1
 
+              // جستجوی ایموجی و حالت انتخاب متن
+              private var searchMode = false
+              private var searchQuery = ""
+              private var selectMode = false
+
+              private var rootView: LinearLayout? = null
+              private var vibrator: Vibrator? = null
+              private var audio: AudioManager? = null
+
               private lateinit var suggestionBar: LinearLayout
               private lateinit var keysArea: SwipeLayout
               private val store by lazy { PhraseStore(applicationContext) }
@@ -746,8 +802,13 @@ jobs:
 
               // ---- رنگ‌ها (روشن/تیره مثل سامسونگ) ----
               private val dark: Boolean
-                  get() = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
-                      Configuration.UI_MODE_NIGHT_YES
+                  get() = when (KbSettings.theme(this)) {
+                      1 -> false
+                      2 -> true
+                      else -> (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                          Configuration.UI_MODE_NIGHT_YES
+                  }
+              private val accent: Int get() = KbSettings.accentColor(this)
               private val cBg: Int get() = if (dark) 0xFF1C1C1E.toInt() else 0xFFEEEFF3.toInt()
               private val cKey: Int get() = if (dark) 0xFF3A3A3C.toInt() else 0xFFFFFFFF.toInt()
               private val cSpecial: Int get() = if (dark) 0xFF2C2C2E.toInt() else 0xFFD9DBE1.toInt()
@@ -759,6 +820,9 @@ jobs:
                   super.onCreate()
                   clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                   clipboard?.addPrimaryClipChangedListener(clipListener)
+                  @Suppress("DEPRECATION")
+                  vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                  audio = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
               }
 
               override fun onDestroy() {
@@ -790,11 +854,35 @@ jobs:
                       setPadding(dp(3), 0, dp(3), dp(4))
                       onSwipe = { pts, keys -> handleSwipe(pts, keys) }
                   }
-                  root.addView(keysArea)
+                  root.addView(keysArea, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                  ))
 
+                  rootView = root
+                  applyChrome()
                   showLetters()
                   updateSuggestions()
                   return root
+              }
+
+              /** رنگ پس‌زمینه، رنگ تأکید و حالت تک‌دست را از تنظیمات اعمال می‌کند. */
+              private fun applyChrome() {
+                  val root = rootView ?: return
+                  if (!::suggestionBar.isInitialized || !::keysArea.isInitialized) return
+                  root.setBackgroundColor(cBg)
+                  keysArea.trailColor = accent
+                  val mode = KbSettings.oneHand(this)
+                  val screenW = resources.displayMetrics.widthPixels
+                  val w = if (mode == 0) LinearLayout.LayoutParams.MATCH_PARENT else (screenW * 0.8f).toInt()
+                  val g = when (mode) {
+                      1 -> Gravity.LEFT
+                      2 -> Gravity.RIGHT
+                      else -> Gravity.NO_GRAVITY
+                  }
+                  (suggestionBar.layoutParams as? LinearLayout.LayoutParams)?.let { it.width = w; it.gravity = g }
+                  (keysArea.layoutParams as? LinearLayout.LayoutParams)?.let { it.width = w; it.gravity = g }
+                  suggestionBar.requestLayout()
+                  keysArea.requestLayout()
               }
 
               override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
@@ -802,12 +890,17 @@ jobs:
                   // در فیلد رمز عبور و فیلدهای حساس ذخیره و پیشنهاد خاموش است
                   learningEnabled = !isSensitiveField(info)
                   swipeChips = emptyList()
+                  searchMode = false
+                  searchQuery = ""
+                  selectMode = false
+                  store.clipExpire(KbSettings.clipTtlHours(this))
                   captureClip()
                   handler.removeCallbacks(clipPoll)
                   handler.postDelayed(clipPoll, 1500)
 
                   // در فیلدهای عددی/تلفن مستقیم صفحه‌ی اعداد باز می‌شود
                   if (::keysArea.isInitialized) {
+                      applyChrome()
                       val cls = (info?.inputType ?: 0) and InputType.TYPE_MASK_CLASS
                       if (cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE) {
                           showNumbers()
@@ -839,7 +932,7 @@ jobs:
 
               // ---- صفحه‌ی حروف ----
               private fun showLetters() {
-                  resetKeys(learningEnabled)   // سوایپ فقط در صفحه‌ی حروف (و نه در فیلد رمز) فعال است
+                  resetKeys(learningEnabled && KbSettings.swipe(this) && !searchMode)   // سوایپ فقط در صفحه‌ی حروف (و نه در فیلد رمز) فعال است
                   val rows = if (fa) FA_ROWS else EN_ROWS
 
                   keysArea.addView(letterRow(rows[0], 0f))
@@ -848,7 +941,7 @@ jobs:
                   // ردیف سوم: شیفت + حروف + پاک‌کردن (با نگه‌داشتن، تکرار می‌شود)
                   val r3 = newRow(52)
                   val shiftKey = key("⇧", 22f, true) { shift = !shift; showLetters() }
-                  if (shift) shiftKey.setTextColor(0xFF2F6BFF.toInt())
+                  if (shift) shiftKey.setTextColor(accent)
                   r3.addView(shiftKey, weight(1.5f))
                   rows[2].forEach { r3.addView(letterKey(it), weight(1f)) }
                   r3.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
@@ -897,7 +990,7 @@ jobs:
                   label: String, hint: String?, size: Float, longPress: String? = hint, onClick: () -> Unit
               ): View {
                   val btn = key(label, size, false, onClick)
-                  if (longPress != null) btn.setOnLongClickListener { type(longPress); true }
+                  if (longPress != null) btn.setOnLongClickListener { feedback(); type(longPress); true }
                   if (hint == null) return btn
                   val frame = FrameLayout(this)
                   frame.addView(btn, FrameLayout.LayoutParams(
@@ -959,12 +1052,14 @@ jobs:
               }
 
               private fun type(text: String) {
+                  if (searchMode) { searchQuery += text; updateSuggestions(); return }
                   swipeChips = emptyList()
                   currentInputConnection?.commitText(normalizeDigits(text), 1)
                   updateSuggestions()
               }
 
               private fun backspace() {
+                  if (searchMode) { searchQuery = searchQuery.dropLast(1); updateSuggestions(); return }
                   swipeChips = emptyList()
                   val ic = currentInputConnection ?: return
                   val selected = ic.getSelectedText(0)
@@ -977,12 +1072,98 @@ jobs:
               }
 
               private fun enter() {
+                  if (searchMode) { exitSearch(); return }
                   swipeChips = emptyList()
                   currentInputConnection?.apply {
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
                   }
                   updateSuggestions()
+              }
+
+              // ---- لرزش و صدای کلید ----
+              private fun feedback() {
+                  if (KbSettings.vibrate(this)) {
+                      val v = vibrator
+                      if (v != null && v.hasVibrator()) {
+                          if (Build.VERSION.SDK_INT >= 26) {
+                              v.vibrate(VibrationEffect.createOneShot(18, VibrationEffect.DEFAULT_AMPLITUDE))
+                          } else {
+                              @Suppress("DEPRECATION")
+                              v.vibrate(18)
+                          }
+                      }
+                  }
+                  if (KbSettings.sound(this)) audio?.playSoundEffect(AudioManager.FX_KEYPRESS_STANDARD, -1f)
+              }
+
+              // ---- حرکت مکان‌نما و انتخاب ----
+              private fun sendDpad(code: Int, withShift: Boolean) {
+                  val ic = currentInputConnection ?: return
+                  val meta = if (withShift) KeyEvent.META_SHIFT_ON else 0
+                  val t = SystemClock.uptimeMillis()
+                  ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, code, 0, meta))
+                  ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, code, 0, meta))
+              }
+
+              /**
+               * ناحیه‌ای که با کشیدن انگشت روی آن، مکان‌نما حرکت می‌کند (به چپ و راست).
+               * اگر withShift درست باشد، به‌جای حرکت، متن انتخاب می‌شود.
+               */
+              private fun attachDragCursor(view: View, withShift: () -> Boolean, onTap: (() -> Unit)?) {
+                  val step = dp(14).toFloat()
+                  val threshold = dp(12).toFloat()
+                  var downX = 0f
+                  var lastX = 0f
+                  var moved = false
+                  view.setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              v.isPressed = true
+                              v.parent?.requestDisallowInterceptTouchEvent(true)
+                              downX = e.x
+                              lastX = e.x
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              if (!moved && Math.abs(e.x - downX) > threshold) {
+                                  moved = true
+                                  lastX = e.x
+                              }
+                              if (moved) {
+                                  var d = e.x - lastX
+                                  while (Math.abs(d) >= step) {
+                                      sendDpad(
+                                          if (d > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT,
+                                          withShift()
+                                      )
+                                      lastX += if (d > 0) step else -step
+                                      d = e.x - lastX
+                                  }
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              v.isPressed = false
+                              if (!moved) { feedback(); onTap?.invoke() } else { swipeChips = emptyList(); updateSuggestions() }
+                          }
+                          MotionEvent.ACTION_CANCEL -> v.isPressed = false
+                      }
+                      true
+                  }
+              }
+
+              private fun spaceKey(label: String): Button {
+                  val b = key(label, 15f) {}
+                  attachDragCursor(b, { false }) { type(" ") }
+                  return b
+              }
+
+              private fun openSettings() {
+                  try {
+                      startActivity(Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } catch (e: Exception) {
+                      flash("باز کردن تنظیمات ممکن نشد")
+                  }
               }
 
               // ---- متن فیلد / ذخیره‌ی دستی ----
@@ -1056,7 +1237,7 @@ jobs:
                       val t = clip.getItemAt(0).coerceToText(this)?.toString()?.trim().orEmpty()
                       if (t.isEmpty()) { lastClipStatus = "آخرین کپی متن نیست"; return false }
                       if (t.length > 2000) { lastClipStatus = "آخرین کپی خیلی بلند است (بیش از ۲۰۰۰ حرف)"; return false }
-                      store.clipAdd(t)
+                      store.clipAdd(t, KbSettings.clipTtlHours(this))
                       lastClipStatus = ""
                       return true
                   } catch (e: Exception) {
@@ -1070,7 +1251,7 @@ jobs:
                   fun tool(icon: String, action: () -> Unit) {
                       val b = Button(this).apply {
                           text = icon
-                          textSize = 20f
+                          textSize = 18f
                           isAllCaps = false
                           minWidth = 0
                           minimumWidth = 0
@@ -1080,7 +1261,7 @@ jobs:
                           setBackgroundColor(Color.TRANSPARENT)
                           stateListAnimator = null
                           setTextColor(cText)
-                          setOnClickListener { action() }
+                          setOnClickListener { feedback(); action() }
                       }
                       suggestionBar.addView(b, weight(1f))
                   }
@@ -1088,13 +1269,17 @@ jobs:
                   tool("📋") { showClips() }
                   tool("📝") { showSaved() }
                   tool("⭐") { saveCurrent() }
+                  tool("✂️") { showEdit() }
                   tool("🔢") { showNumbers() }
                   tool("💳") { showVault() }
+                  tool("⚙️") { openSettings() }
               }
 
               private fun updateSuggestions() {
                   if (!::suggestionBar.isInitialized) return
                   suggestionBar.removeAllViews()
+
+                  if (searchMode) { renderSearchBar(); return }
 
                   // بعد از سوایپ: کلمه‌های محتمل (لمس هر کدام، کلمه‌ی وارد‌شده را عوض می‌کند)
                   if (swipeChips.isNotEmpty()) {
@@ -1156,7 +1341,7 @@ jobs:
               }
 
               // ---- صفحه‌های فهرست (جمله‌ها / کلیپ‌بورد / گاوصندوق) ----
-              private class Row(val key: String, val label: String)
+              private class Row(val key: String, val label: String, val pinned: Boolean = false)
 
               private fun showListPage(
                   emptyMsg: String,
@@ -1164,7 +1349,8 @@ jobs:
                   onPick: (Row) -> Unit,
                   onDelete: (Row) -> Unit,
                   extraLabel: String? = null,
-                  onExtra: (() -> Unit)? = null
+                  onExtra: (() -> Unit)? = null,
+                  onPin: ((Row) -> Unit)? = null
               ) {
                   resetKeys(false)
                   val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -1182,6 +1368,11 @@ jobs:
                           layoutDirection = View.LAYOUT_DIRECTION_LTR
                       }
                       row.addView(key("🗑", 16f, true) { onDelete(r) }, smallKeyParams())
+                      if (onPin != null) {
+                          val pin = key("📌", 16f, true) { onPin(r) }
+                          if (r.pinned) pin.background = keyBg(accent, cPressed)
+                          row.addView(pin, smallKeyParams())
+                      }
                       val k = key(r.label, 15f) { onPick(r) }.apply {
                           maxLines = 1
                           ellipsize = TextUtils.TruncateAt.END
@@ -1219,20 +1410,19 @@ jobs:
               }
 
               private fun showClips() {
+                  store.clipExpire(KbSettings.clipTtlHours(this))
                   val ok = captureClip()
-                  val rows = store.clipList()
+                  val rows = store.clipItems().map { (t, pinned) -> Row(t, t.replace("\n", " "), pinned) }
                   val empty = "کلیپ‌بورد خالی است.\n" +
                       (if (lastClipStatus.isNotEmpty()) lastClipStatus else "چیزی را کپی کن تا اینجا بیاید.")
                   showListPage(
                       empty,
-                      rows.map { Row(it, it.replace("\n", " ")) },
-                      onPick = { r -> commitAndClose(store.clipList().firstOrNull { it.replace("\n", " ") == r.label } ?: r.label) },
-                      onDelete = { r ->
-                          store.clipList().firstOrNull { it.replace("\n", " ") == r.label }?.let { store.clipDelete(it) }
-                          showClips()
-                      },
-                      extraLabel = "پاک‌کردن همه",
-                      onExtra = { store.clipClear(); showClips() }
+                      rows,
+                      onPick = { r -> commitAndClose(r.key) },
+                      onDelete = { r -> store.clipDelete(r.key); showClips() },
+                      extraLabel = "پاک‌کردن بقیه (پین‌ها می‌مانند)",
+                      onExtra = { store.clipClear(); showClips() },
+                      onPin = { r -> store.clipSetPinned(r.key, !r.pinned); showClips() }
                   )
                   // اگر خواندن کلیپ‌بورد مشکل داشت، علتش بالای کیبورد هم نشان داده می‌شود
                   if (!ok && lastClipStatus.isNotEmpty() && rows.isNotEmpty()) flash(lastClipStatus)
@@ -1302,6 +1492,21 @@ jobs:
                       }
                       tabs.addView(t, weight(1f))
                   }
+                  // تب جستجو با کلمه‌ی فارسی
+                  tabs.addView(Button(this).apply {
+                      text = "🔍"
+                      textSize = 20f
+                      isAllCaps = false
+                      minWidth = 0
+                      minimumWidth = 0
+                      minHeight = 0
+                      minimumHeight = 0
+                      setPadding(0, 0, 0, 0)
+                      stateListAnimator = null
+                      setTextColor(cText)
+                      setBackgroundColor(Color.TRANSPARENT)
+                      setOnClickListener { startEmojiSearch() }
+                  }, weight(1f))
                   keysArea.addView(tabs)
 
                   // شبکه‌ی ایموجی‌ها (۸ تا در هر ردیف)
@@ -1348,6 +1553,143 @@ jobs:
                   bottom.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(4f))
                   bottom.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
                   keysArea.addView(bottom)
+              }
+
+              // ---- جستجوی ایموجی ----
+              private fun startEmojiSearch() {
+                  searchMode = true
+                  searchQuery = ""
+                  lang = "fa"
+                  shift = false
+                  showLetters()
+                  updateSuggestions()
+              }
+
+              private fun exitSearch() {
+                  searchMode = false
+                  searchQuery = ""
+                  showEmoji()
+                  updateSuggestions()
+              }
+
+              private fun renderSearchBar() {
+                  suggestionBar.addView(key("✕", 16f, true) { exitSearch() }, weight(0.7f))
+                  suggestionBar.addView(TextView(this).apply {
+                      text = if (searchQuery.isEmpty()) "🔍 بنویس: خنده، قلب…" else searchQuery
+                      setTextColor(if (searchQuery.isEmpty()) cHint else cText)
+                      background = roundBg(cKey)
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      maxLines = 1
+                      ellipsize = TextUtils.TruncateAt.START
+                      setPadding(dp(6), 0, dp(6), 0)
+                  }, weight(1.6f))
+
+                  val results = EmojiSearch.search(searchQuery)
+                  val scroll = HorizontalScrollView(this).apply {
+                      isHorizontalScrollBarEnabled = false
+                      layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  }
+                  val lin = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  }
+                  results.forEach { e ->
+                      lin.addView(TextView(this).apply {
+                          text = e
+                          textSize = 26f
+                          gravity = Gravity.CENTER
+                          setPadding(dp(8), 0, dp(8), 0)
+                          setOnClickListener {
+                              feedback()
+                              currentInputConnection?.commitText(e, 1)
+                              addRecentEmoji(e)
+                          }
+                      }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
+                  }
+                  if (results.isEmpty() && searchQuery.isNotEmpty()) {
+                      lin.addView(TextView(this).apply {
+                          text = "چیزی پیدا نشد"
+                          setTextColor(cHint)
+                          textSize = 14f
+                          gravity = Gravity.CENTER
+                          setPadding(dp(12), 0, dp(12), 0)
+                      }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
+                  }
+                  scroll.addView(lin)
+                  suggestionBar.addView(scroll, weight(3.2f))
+              }
+
+              // ---- صفحه‌ی ویرایش: انتخاب، کپی، برش، چسباندن، حرکت مکان‌نما ----
+              private fun showEdit() {
+                  resetKeys(false)
+
+                  val top = newRow(52)
+                  top.addView(key("انتخاب همه", 13f, true) {
+                      currentInputConnection?.performContextMenuAction(android.R.id.selectAll)
+                  }, weight(1.4f))
+                  top.addView(key("کپی", 14f, true) { editCopy(false) }, weight(1f))
+                  top.addView(key("برش", 14f, true) { editCopy(true) }, weight(1f))
+                  top.addView(key("چسباندن", 14f, true) { editPaste() }, weight(1.2f))
+                  keysArea.addView(top)
+
+                  // نوار انتخاب: کشیدن انگشت روی آن، متن را انتخاب می‌کند
+                  val bar = TextView(this).apply {
+                      text = "◀   برای انتخاب متن، اینجا بکش   ▶"
+                      setTextColor(0xFFFFFFFF.toInt())
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      background = roundBg(accent)
+                  }
+                  attachDragCursor(bar, { true }, null)
+                  keysArea.addView(bar, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, dp((56 * KbSettings.heightScale(this)).toInt())
+                  ).apply { setMargins(dp(3), dp(6), dp(3), dp(2)) })
+
+                  // کلیدهای جهت‌دار؛ اگر حالت «انتخاب» روشن باشد، به‌جای حرکت، انتخاب را گسترش می‌دهند
+                  val arrows = newRow(52)
+                  arrows.addView(repeatKey("⇤", 18f) { sendDpad(KeyEvent.KEYCODE_MOVE_HOME, selectMode) }, weight(1f))
+                  arrows.addView(repeatKey("◀", 18f) { sendDpad(KeyEvent.KEYCODE_DPAD_LEFT, selectMode) }, weight(1f))
+                  arrows.addView(repeatKey("▲", 18f) { sendDpad(KeyEvent.KEYCODE_DPAD_UP, selectMode) }, weight(1f))
+                  arrows.addView(repeatKey("▼", 18f) { sendDpad(KeyEvent.KEYCODE_DPAD_DOWN, selectMode) }, weight(1f))
+                  arrows.addView(repeatKey("▶", 18f) { sendDpad(KeyEvent.KEYCODE_DPAD_RIGHT, selectMode) }, weight(1f))
+                  arrows.addView(repeatKey("⇥", 18f) { sendDpad(KeyEvent.KEYCODE_MOVE_END, selectMode) }, weight(1f))
+                  keysArea.addView(arrows)
+
+                  val bottom = newRow(52)
+                  bottom.addView(key(if (fa) "ابج" else "ABC", 18f, true) { showLetters(); updateSuggestions() }, weight(1.5f))
+                  val sel = key(if (selectMode) "☑ انتخاب با جهت‌ها: روشن" else "☐ انتخاب با جهت‌ها: خاموش", 13f, !selectMode) {
+                      selectMode = !selectMode
+                      showEdit()
+                  }
+                  if (selectMode) sel.background = keyBg(accent, cPressed)
+                  if (selectMode) sel.setTextColor(0xFFFFFFFF.toInt())
+                  bottom.addView(sel, weight(4f))
+                  bottom.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
+                  keysArea.addView(bottom)
+              }
+
+              private fun editCopy(cut: Boolean) {
+                  val ic = currentInputConnection ?: return
+                  val selected = ic.getSelectedText(0)
+                  if (selected.isNullOrEmpty()) { flash("اول متن را انتخاب کن"); return }
+                  val txt = selected.toString()
+                  try {
+                      clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("kb", txt))
+                  } catch (e: Exception) {
+                      ic.performContextMenuAction(if (cut) android.R.id.cut else android.R.id.copy)
+                  }
+                  if (cut) ic.commitText("", 1)
+                  captureClip()
+                  flash(if (cut) "✓ بریده شد" else "✓ کپی شد")
+              }
+
+              private fun editPaste() {
+                  val ic = currentInputConnection ?: return
+                  val t = try {
+                      clipboard?.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
+                  } catch (e: Exception) { "" }
+                  if (t.isNotEmpty()) ic.commitText(t, 1) else flash("چیزی برای چسباندن نیست")
               }
 
               // ---- سوایپ ----
@@ -1445,7 +1787,7 @@ jobs:
                   b.addView(key(leftLabel, leftSize, true) { onLeft() }, weight(1.4f))
                   b.addView(key("🌐", 18f, true) { onLang() }, weight(1.1f))
                   b.addView(keyWithAlt(if (fa) "،" else ",", "!", 20f) { type(if (fa) "،" else ",") }, weight(1f))
-                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(3.5f))
+                  b.addView(spaceKey(if (fa) "فارسی" else "English"), weight(3.5f))
                   if (fa) {
                       // کلید سمت راست فاصله: نیم‌فاصله (ZWNJ)
                       b.addView(key("↔", 18f, true) { type("\u200c") }, weight(1f))
@@ -1473,7 +1815,7 @@ jobs:
                   orientation = LinearLayout.HORIZONTAL
                   layoutDirection = View.LAYOUT_DIRECTION_LTR
                   layoutParams = LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp)
+                      LinearLayout.LayoutParams.MATCH_PARENT, dp((heightDp * KbSettings.heightScale(this@SmartKeyboardService)).toInt())
                   )
               }
 
@@ -1490,7 +1832,7 @@ jobs:
                       setTextColor(cText)
                       background = keyBg(if (special) cSpecial else cKey, cPressed)
                       stateListAnimator = null
-                      setOnClickListener { onClick() }
+                      setOnClickListener { feedback(); onClick() }
                   }
 
               /** کلیدی که با نگه‌داشتن، مرتب تکرار می‌شود (مثل پاک‌کردن) */
@@ -1506,6 +1848,7 @@ jobs:
                       when (e.actionMasked) {
                           MotionEvent.ACTION_DOWN -> {
                               v.isPressed = true
+                              feedback()
                               action()
                               handler.postDelayed(repeater, 400)
                           }
@@ -1530,6 +1873,659 @@ jobs:
                   }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/KbSettings.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          /** تنظیمات کیبورد؛ هم از صفحه‌ی تنظیمات نوشته می‌شود و هم کیبورد از همین‌جا می‌خواند. */
+          object KbSettings {
+              const val FILE = "kb"
+
+              val HEIGHT_LABELS = listOf("خیلی کوچک", "کوچک", "معمولی", "بلند", "خیلی بلند")
+              private val HEIGHT_SCALES = floatArrayOf(0.82f, 0.92f, 1.0f, 1.1f, 1.22f)
+
+              val THEME_LABELS = listOf("خودکار", "روشن", "تیره")
+
+              val ACCENT_LABELS = listOf("آبی", "سبز", "بنفش", "نارنجی", "صورتی")
+              private val ACCENTS = intArrayOf(
+                  0xFF2F6BFF.toInt(), 0xFF22A559.toInt(), 0xFF8E5BE8.toInt(), 0xFFF28C1B.toInt(), 0xFFE9457F.toInt()
+              )
+
+              val HAND_LABELS = listOf("خاموش", "چپ", "راست")
+
+              val TTL_LABELS = listOf("۱ ساعت", "۶ ساعت", "۱۲ ساعت", "۲۴ ساعت", "۳ روز", "هرگز")
+              private val TTL_HOURS = intArrayOf(1, 6, 12, 24, 72, 0)
+
+              fun prefs(c: Context): SharedPreferences = c.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+
+              fun vibrate(c: Context) = prefs(c).getBoolean("vib", true)
+              fun setVibrate(c: Context, v: Boolean) = prefs(c).edit().putBoolean("vib", v).apply()
+
+              fun sound(c: Context) = prefs(c).getBoolean("snd", false)
+              fun setSound(c: Context, v: Boolean) = prefs(c).edit().putBoolean("snd", v).apply()
+
+              fun swipe(c: Context) = prefs(c).getBoolean("swipe", true)
+              fun setSwipe(c: Context, v: Boolean) = prefs(c).edit().putBoolean("swipe", v).apply()
+
+              /** 0 خودکار (طبق گوشی)، 1 روشن، 2 تیره */
+              fun theme(c: Context) = prefs(c).getInt("theme", 0).coerceIn(0, 2)
+              fun setTheme(c: Context, v: Int) = prefs(c).edit().putInt("theme", v).apply()
+
+              fun accentIndex(c: Context) = prefs(c).getInt("accent", 0).coerceIn(0, ACCENTS.size - 1)
+              fun setAccent(c: Context, v: Int) = prefs(c).edit().putInt("accent", v).apply()
+              fun accentColor(c: Context): Int = ACCENTS[accentIndex(c)]
+              fun accentColorAt(i: Int): Int = ACCENTS[i]
+
+              fun heightIndex(c: Context) = prefs(c).getInt("height", 2).coerceIn(0, HEIGHT_SCALES.size - 1)
+              fun setHeight(c: Context, v: Int) = prefs(c).edit().putInt("height", v).apply()
+              fun heightScale(c: Context): Float = HEIGHT_SCALES[heightIndex(c)]
+
+              /** 0 خاموش، 1 چپ، 2 راست */
+              fun oneHand(c: Context) = prefs(c).getInt("onehand", 0).coerceIn(0, 2)
+              fun setOneHand(c: Context, v: Int) = prefs(c).edit().putInt("onehand", v).apply()
+
+              fun ttlIndex(c: Context) = prefs(c).getInt("clip_ttl_idx", 3).coerceIn(0, TTL_HOURS.size - 1)
+              fun setTtl(c: Context, v: Int) = prefs(c).edit().putInt("clip_ttl_idx", v).apply()
+              /** ساعت؛ 0 یعنی هرگز پاک نشود */
+              fun clipTtlHours(c: Context): Int = TTL_HOURS[ttlIndex(c)]
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/EmojiSearch.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          /** جستجوی ایموجی با کلمه‌ی فارسی (یا خود ایموجی). هر خط: ایموجی | کلمه‌های کلیدی */
+          object EmojiSearch {
+
+              private val RAW = """
+          😀|خنده لبخند شاد خوشحال
+          😃|خنده لبخند شاد دهان باز
+          😄|خنده شاد خوشحال لبخند
+          😁|خنده دندان لبخند شاد
+          😆|خنده قهقهه شاد
+          😅|عرق خنده خجالت نفس راحت
+          😂|خنده اشک قهقهه
+          🤣|خنده غلت قهقهه
+          😊|لبخند خجالت شاد
+          😇|فرشته معصوم هاله
+          🙂|لبخند ساده
+          🙃|وارونه شوخی
+          😉|چشمک
+          😌|آرامش راحت
+          😍|عاشق قلب دوست‌داشتن چشم‌قلبی
+          🥰|عاشق قلب دوست‌داشتن مهربان
+          😘|بوسه ماچ
+          😗|بوسه
+          😙|بوسه
+          😚|بوسه
+          😋|خوشمزه نیش زبان
+          😛|زبان شوخی
+          😝|زبان شوخی
+          😜|زبان چشمک شوخی
+          🤪|دیوانه شوخی
+          🤨|شک ابرو تردید
+          🧐|تک‌چشمی بررسی
+          🤓|عینکی درس‌خوان
+          😎|عینک آفتابی باحال
+          🥳|جشن تولد پارتی
+          😏|پوزخند
+          😒|بی‌حوصله ناراضی
+          😞|ناراحت غمگین
+          😔|غمگین فکر
+          😟|نگران
+          😕|گیج
+          🙁|ناراحت اخم
+          😣|تحمل درد
+          😖|ناراحت درد
+          😫|خسته
+          😩|خسته کلافه
+          🥺|التماس خواهش مظلوم
+          😢|گریه اشک غمگین
+          😭|گریه زار اشک
+          😤|عصبانی لجبازی
+          😠|عصبانی خشم
+          😡|عصبانی خشم قرمز
+          🤬|فحش عصبانی ناسزا
+          🤯|شوک انفجار مغز
+          😳|خجالت شوکه
+          🥵|گرما داغ
+          🥶|سرما یخ
+          😱|ترس فریاد وحشت
+          😨|ترس
+          😰|ترس عرق نگرانی
+          😥|نگران غم
+          😓|عرق خستگی
+          🤗|بغل آغوش
+          🤔|فکر فکور
+          🤭|پنهان خنده
+          🤫|ساکت هیس
+          🤥|دروغ
+          😶|ساکت بی‌حرف
+          😐|بی‌تفاوت
+          😑|بی‌تفاوت
+          😬|دندان قروچه خجالت
+          🙄|چشم‌غره
+          😯|تعجب
+          😦|تعجب
+          😧|ناراحت وحشت
+          😮|تعجب دهان باز
+          😲|تعجب شوک
+          🥱|خمیازه خواب خسته
+          😴|خواب خوابیدن
+          🤤|آب دهان
+          😪|خواب خسته
+          😵|گیج سرگیجه
+          🤐|زیپ ساکت
+          🥴|گیج مست
+          🤢|حالت تهوع مریض
+          🤮|استفراغ
+          🤧|عطسه سرماخوردگی
+          😷|ماسک بیمار
+          🤒|تب بیمار
+          🤕|زخم سر بیمار
+          👍|لایک خوب تایید بله عالی
+          👎|دیسلایک بد
+          👌|اوکی عالی
+          ✌️|پیروزی صلح
+          🤞|انگشت‌ضربدری شانس
+          🤟|دوستت‌دارم
+          🤘|راک
+          🤙|تماس زنگ
+          👈|اشاره چپ
+          👉|اشاره راست
+          👆|اشاره بالا
+          👇|اشاره پایین
+          ☝️|اشاره یک
+          ✋|دست ایست صبر
+          🤚|دست
+          🖐️|دست باز
+          🖖|ولکان
+          👋|سلام خداحافظی دست
+          🤝|دست‌دادن توافق قرارداد
+          🙏|خواهش دعا تشکر ممنون
+          ✍️|نوشتن
+          💪|قدرت عضله ورزش
+          👏|دست‌زدن تشویق آفرین
+          🙌|هورا جشن
+          👐|دست باز
+          🤲|دعا دست
+          ❤️|قلب عشق دوست‌داشتن قرمز
+          🧡|قلب نارنجی عشق
+          💛|قلب زرد عشق
+          💚|قلب سبز عشق
+          💙|قلب آبی عشق
+          💜|قلب بنفش عشق
+          🖤|قلب سیاه
+          🤍|قلب سفید
+          🤎|قلب قهوه‌ای
+          💔|قلب شکسته غم
+          ❣️|قلب عشق
+          💕|قلب‌ها عشق
+          💞|قلب‌ها عشق
+          💓|قلب تپش عشق
+          💗|قلب عشق
+          💖|قلب درخشان عشق
+          💘|قلب تیر عشق
+          💝|قلب هدیه عشق
+          💯|صد کامل عالی
+          ✨|درخشش ستاره جرقه
+          ⭐|ستاره
+          🌟|ستاره درخشان
+          🔥|آتش داغ
+          💥|انفجار
+          🎉|جشن تبریک تولد
+          🎊|جشن تبریک
+          🐶|سگ
+          🐱|گربه
+          🐭|موش
+          🐹|همستر
+          🐰|خرگوش
+          🦊|روباه
+          🐻|خرس
+          🐼|پاندا
+          🐨|کوآلا
+          🐯|ببر
+          🦁|شیر
+          🐮|گاو
+          🐷|خوک
+          🐸|قورباغه
+          🐵|میمون
+          🐔|مرغ
+          🐧|پنگوئن
+          🐦|پرنده
+          🐤|جوجه
+          🦆|اردک
+          🦅|عقاب
+          🦉|جغد
+          🐺|گرگ
+          🐴|اسب
+          🦄|اسب‌شاخ‌دار
+          🐝|زنبور عسل
+          🦋|پروانه
+          🐌|حلزون
+          🐞|کفشدوزک
+          🐢|لاک‌پشت
+          🐍|مار
+          🐙|هشت‌پا
+          🐬|دلفین
+          🐳|نهنگ
+          🐟|ماهی
+          🌹|گل رز
+          🌷|گل لاله
+          🌸|شکوفه گل
+          🌻|آفتابگردان گل
+          🌼|گل
+          🌲|درخت
+          🌴|نخل درخت
+          🍀|شانس شبدر
+          🌍|زمین جهان
+          🌙|ماه شب
+          ☀️|خورشید آفتاب
+          ⛅|ابر خورشید
+          ☁️|ابر
+          🌧️|باران
+          ❄️|برف سرما
+          ⚡|برق رعد
+          🌈|رنگین‌کمان
+          🍎|سیب
+          🍐|گلابی
+          🍊|پرتقال
+          🍋|لیمو
+          🍌|موز
+          🍉|هندوانه
+          🍇|انگور
+          🍓|توت‌فرنگی
+          🍒|گیلاس
+          🍑|هلو
+          🥭|انبه
+          🍍|آناناس
+          🥝|کیوی
+          🍅|گوجه
+          🥑|آووکادو
+          🍆|بادمجان
+          🥕|هویج
+          🌽|ذرت
+          🥔|سیب‌زمینی
+          🍞|نان
+          🧀|پنیر
+          🍳|تخم‌مرغ صبحانه
+          🥞|پنکیک
+          🍔|همبرگر
+          🍟|سیب‌زمینی سرخ‌کرده
+          🍕|پیتزا
+          🌭|هات‌داگ
+          🥪|ساندویچ
+          🌮|تاکو
+          🍗|مرغ
+          🍖|گوشت کباب
+          🍚|برنج
+          🍜|نودل سوپ
+          🍝|اسپاگتی ماکارونی
+          🍣|سوشی
+          🍦|بستنی
+          🍩|دونات
+          🍪|کلوچه شیرینی
+          🎂|کیک تولد
+          🍰|کیک
+          🍫|شکلات
+          🍬|آبنبات
+          ☕|قهوه چای
+          🍵|چای
+          🥤|نوشیدنی
+          🍺|آبجو
+          ⚽|فوتبال توپ ورزش
+          🏀|بسکتبال ورزش
+          🏈|فوتبال‌آمریکایی
+          🎮|بازی گیم
+          🎧|هدفون موسیقی
+          🎵|موسیقی آهنگ
+          🎶|موسیقی آهنگ
+          📱|موبایل گوشی
+          💻|لپ‌تاپ کامپیوتر
+          📷|دوربین عکس
+          📚|کتاب درس
+          ✏️|مداد نوشتن
+          📌|پین سنجاق
+          📎|گیره
+          🔑|کلید
+          🔒|قفل
+          💡|لامپ ایده
+          💰|پول
+          💳|کارت بانکی
+          🎁|هدیه کادو
+          🕌|مسجد
+          🚗|ماشین
+          ✈️|هواپیما سفر
+          🏠|خانه
+          ⏰|ساعت زنگ
+          ✅|تایید درست انجام
+          ❌|نه اشتباه لغو
+          ❓|سوال
+          ❗|تعجب هشدار
+          ⚠️|هشدار خطر
+          ➕|بعلاوه جمع
+          ➖|منها
+          ✔️|تیک درست
+          💬|پیام چت
+          👀|چشم نگاه
+          """.trimIndent()
+
+              private class E(val emoji: String, val keys: String)
+
+              private val DATA: List<E> by lazy {
+                  RAW.lines().mapNotNull { line ->
+                      val i = line.indexOf('|')
+                      if (i <= 0) null else E(line.substring(0, i).trim(), norm(line.substring(i + 1)))
+                  }
+              }
+
+              /** یکسان‌سازی حروف عربی/فارسی و حذف نیم‌فاصله و فاصله */
+              private fun norm(s: String): String = buildString {
+                  for (ch in s) {
+                      when (ch) {
+                          'ي', 'ى' -> append('ی')
+                          'ك' -> append('ک')
+                          '\u200c', '-' -> {}
+                          else -> append(ch)
+                      }
+                  }
+              }.trim()
+
+              fun search(query: String, limit: Int = 40): List<String> {
+                  val q = norm(query).replace(" ", "")
+                  if (q.isEmpty()) return emptyList()
+                  val exact = ArrayList<String>()
+                  val partial = ArrayList<String>()
+                  for (e in DATA) {
+                      val words = e.keys.split(" ").map { it.trim() }.filter { it.isNotEmpty() }
+                      when {
+                          e.emoji == query.trim() -> exact.add(e.emoji)
+                          words.any { it == q } -> exact.add(e.emoji)
+                          words.any { it.startsWith(q) } -> partial.add(e.emoji)
+                          words.any { it.contains(q) } && q.length >= 2 -> partial.add(e.emoji)
+                      }
+                  }
+                  return (exact + partial).distinct().take(limit)
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/SettingsActivity.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.res.Configuration
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+
+          /** صفحه‌ی تنظیمات کیبورد؛ همه‌ی گزینه‌ها همان لحظه ذخیره می‌شوند. */
+          class SettingsActivity : Activity() {
+
+              private val dark: Boolean
+                  get() = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                      Configuration.UI_MODE_NIGHT_YES
+              private val cBg get() = if (dark) 0xFF121214.toInt() else 0xFFF3F4F8.toInt()
+              private val cCard get() = if (dark) 0xFF1E1E21.toInt() else 0xFFFFFFFF.toInt()
+              private val cText get() = if (dark) 0xFFF2F2F2.toInt() else 0xFF111111.toInt()
+              private val cHint get() = if (dark) 0xFF9A9AA0.toInt() else 0xFF6B7078.toInt()
+              private val cChip get() = if (dark) 0xFF35353A.toInt() else 0xFFE6E8EE.toInt()
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private lateinit var content: LinearLayout
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  title = "تنظیمات کیبورد"
+                  build()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  build()
+              }
+
+              private fun build() {
+                  val scroll = ScrollView(this).apply {
+                      setBackgroundColor(cBg)
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  content = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(14), dp(14), dp(14), dp(24))
+                  }
+                  scroll.addView(content)
+                  setContentView(scroll)
+
+                  content.addView(TextView(this).apply {
+                      text = "تنظیمات کیبورد هوشمند"
+                      setTextColor(cText)
+                      textSize = 20f
+                      setPadding(dp(6), dp(8), dp(6), dp(4))
+                  })
+
+                  // ---- فعال‌سازی ----
+                  section("فعال‌سازی")
+                  card {
+                      addView(actionButton("فعال‌کردن کیبورد در تنظیمات اندروید") {
+                          startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+                      })
+                      addView(actionButton("انتخاب کیبورد فعلی") {
+                          (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                      })
+                  }
+
+                  // ---- بازخورد لمسی ----
+                  section("لرزش و صدا")
+                  card {
+                      addView(switchRow("لرزش هنگام لمس کلید", KbSettings.vibrate(this@SettingsActivity)) {
+                          KbSettings.setVibrate(this@SettingsActivity, it)
+                      })
+                      addView(switchRow("صدای کلید", KbSettings.sound(this@SettingsActivity)) {
+                          KbSettings.setSound(this@SettingsActivity, it)
+                      })
+                  }
+
+                  // ---- تایپ ----
+                  section("تایپ")
+                  card {
+                      addView(switchRow("تایپ با کشیدن انگشت (سوایپ)", KbSettings.swipe(this@SettingsActivity)) {
+                          KbSettings.setSwipe(this@SettingsActivity, it)
+                      })
+                  }
+
+                  // ---- ظاهر ----
+                  section("تم و رنگ")
+                  card {
+                      addView(label("تم"))
+                      addView(choiceRow(KbSettings.THEME_LABELS, KbSettings.theme(this@SettingsActivity)) {
+                          KbSettings.setTheme(this@SettingsActivity, it)
+                      })
+                      addView(label("رنگ تأکید (شیفت، مسیر سوایپ، دکمه‌ها)"))
+                      addView(accentRow())
+                  }
+
+                  section("اندازه و حالت")
+                  card {
+                      addView(label("ارتفاع کیبورد"))
+                      addView(choiceRow(KbSettings.HEIGHT_LABELS, KbSettings.heightIndex(this@SettingsActivity)) {
+                          KbSettings.setHeight(this@SettingsActivity, it)
+                      })
+                      addView(label("حالت تک‌دست"))
+                      addView(choiceRow(KbSettings.HAND_LABELS, KbSettings.oneHand(this@SettingsActivity)) {
+                          KbSettings.setOneHand(this@SettingsActivity, it)
+                      })
+                  }
+
+                  // ---- کلیپ‌بورد ----
+                  section("کلیپ‌بورد")
+                  card {
+                      addView(label("موارد پین‌نشده بعد از این مدت خودکار پاک شوند"))
+                      addView(choiceRow(KbSettings.TTL_LABELS, KbSettings.ttlIndex(this@SettingsActivity)) {
+                          KbSettings.setTtl(this@SettingsActivity, it)
+                      })
+                      addView(TextView(this@SettingsActivity).apply {
+                          text = "موارد پین‌شده (📌) هیچ‌وقت خودکار پاک نمی‌شوند."
+                          setTextColor(cHint)
+                          textSize = 12f
+                          setPadding(dp(4), dp(6), dp(4), 0)
+                      })
+                  }
+              }
+
+              // ---------- ابزارهای ساخت UI ----------
+              private fun section(t: String) {
+                  content.addView(TextView(this).apply {
+                      text = t
+                      setTextColor(KbSettings.accentColor(this@SettingsActivity))
+                      textSize = 14f
+                      setPadding(dp(6), dp(14), dp(6), dp(6))
+                  })
+              }
+
+              private fun card(fill: LinearLayout.() -> Unit) {
+                  val c = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(12), dp(10), dp(12), dp(12))
+                      background = GradientDrawable().apply {
+                          setColor(cCard)
+                          cornerRadius = dp(14).toFloat()
+                      }
+                  }
+                  c.fill()
+                  content.addView(c, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                  ))
+              }
+
+              private fun label(t: String) = TextView(this).apply {
+                  text = t
+                  setTextColor(cText)
+                  textSize = 14f
+                  setPadding(dp(4), dp(8), dp(4), dp(6))
+              }
+
+              private fun switchRow(t: String, on: Boolean, onChange: (Boolean) -> Unit): View {
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(4), dp(8), dp(4), dp(8))
+                  }
+                  row.addView(TextView(this).apply {
+                      text = t
+                      setTextColor(cText)
+                      textSize = 15f
+                  }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(Switch(this).apply {
+                      isChecked = on
+                      setOnCheckedChangeListener { _, v -> onChange(v) }
+                  })
+                  return row
+              }
+
+              private fun actionButton(t: String, onClick: () -> Unit) = Button(this).apply {
+                  text = t
+                  isAllCaps = false
+                  textSize = 14f
+                  setTextColor(0xFFFFFFFF.toInt())
+                  background = GradientDrawable().apply {
+                      setColor(KbSettings.accentColor(this@SettingsActivity))
+                      cornerRadius = dp(10).toFloat()
+                  }
+                  stateListAnimator = null
+                  setOnClickListener { onClick() }
+                  layoutParams = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, dp(46)
+                  ).apply { setMargins(0, dp(4), 0, dp(4)) }
+              }
+
+              /** ردیف گزینه‌ها؛ در صورت زیاد بودن، در چند خط شکسته می‌شود. */
+              private fun choiceRow(options: List<String>, selected: Int, onPick: (Int) -> Unit): View {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val buttons = ArrayList<Button>()
+                  var current = selected
+                  fun paint() {
+                      buttons.forEachIndexed { i, b ->
+                          val sel = i == current
+                          b.background = GradientDrawable().apply {
+                              setColor(if (sel) KbSettings.accentColor(this@SettingsActivity) else cChip)
+                              cornerRadius = dp(10).toFloat()
+                          }
+                          b.setTextColor(if (sel) 0xFFFFFFFF.toInt() else cText)
+                      }
+                  }
+                  val perLine = if (options.size > 4) 3 else options.size
+                  options.chunked(perLine).forEachIndexed { chunkIdx, chunk ->
+                      val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                      chunk.forEachIndexed { k, name ->
+                          val idx = chunkIdx * perLine + k
+                          val b = Button(this).apply {
+                              text = name
+                              isAllCaps = false
+                              textSize = 13f
+                              minWidth = 0
+                              minimumWidth = 0
+                              minHeight = 0
+                              minimumHeight = 0
+                              stateListAnimator = null
+                              setPadding(dp(4), 0, dp(4), 0)
+                              setOnClickListener {
+                                  current = idx
+                                  paint()
+                                  onPick(idx)
+                              }
+                          }
+                          buttons.add(b)
+                          line.addView(b, LinearLayout.LayoutParams(0, dp(42), 1f).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) })
+                      }
+                      box.addView(line)
+                  }
+                  paint()
+                  return box
+              }
+
+              private fun accentRow(): View {
+                  val line = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(4), 0, dp(6))
+                  }
+                  val current = KbSettings.accentIndex(this)
+                  KbSettings.ACCENT_LABELS.indices.forEach { i ->
+                      val dot = TextView(this).apply {
+                          gravity = Gravity.CENTER
+                          text = if (i == current) "✓" else ""
+                          setTextColor(0xFFFFFFFF.toInt())
+                          textSize = 18f
+                          background = GradientDrawable().apply {
+                              shape = GradientDrawable.OVAL
+                              setColor(KbSettings.accentColorAt(i))
+                          }
+                          setOnClickListener {
+                              KbSettings.setAccent(this@SettingsActivity, i)
+                              build()
+                          }
+                      }
+                      line.addView(dot, LinearLayout.LayoutParams(dp(44), dp(44)).apply { setMargins(dp(8), 0, dp(8), 0) })
+                  }
+                  return line
+              }
           }
           KBEOF
 
