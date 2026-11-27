@@ -134,11 +134,12 @@ jobs:
 
               private var learningEnabled = true
               private lateinit var suggestionBar: LinearLayout
+              private lateinit var keysArea: LinearLayout
 
               private val letterRows = listOf(
                   "ضصثقفغعهخحجچ",
                   "شسیبلاتنمکگ",
-                  "ظطزرذدپو"
+                  "ظطزرذدژپوئ"
               )
 
               override fun onCreateInputView(): View {
@@ -156,21 +157,14 @@ jobs:
                   }
                   root.addView(suggestionBar)
 
-                  // ردیف حروف
-                  letterRows.forEach { row ->
-                      val line = newRow()
-                      row.forEach { ch -> line.addView(key(ch.toString()) { type(ch.toString()) }) }
-                      root.addView(line)
+                  // محل نمایش صفحه‌ی کلیدها (حروف یا اعداد)
+                  keysArea = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
                   }
+                  root.addView(keysArea)
 
-                  // ردیف پایین: نیم‌فاصله، فاصله، پاک‌کردن، اینتر
-                  val bottom = newRow()
-                  bottom.addView(key("‌⎵") { type("\u200c") }, weight(1f))      // نیم‌فاصله (ZWNJ)
-                  bottom.addView(key("فاصله") { type(" ") }, weight(4f))
-                  bottom.addView(key("⌫") { backspace() }, weight(1.5f))
-                  bottom.addView(key("↵") { enter() }, weight(1.5f))
-                  root.addView(bottom)
-
+                  showLetters()
                   return root
               }
 
@@ -178,6 +172,16 @@ jobs:
                   super.onStartInputView(info, restarting)
                   // در فیلد رمز عبور و فیلدهای حساس یادگیری خاموش است
                   learningEnabled = !isSensitiveField(info)
+
+                  // در فیلدهای عددی/تلفن مستقیم صفحه‌ی اعداد باز می‌شود
+                  if (::keysArea.isInitialized) {
+                      val cls = (info?.inputType ?: 0) and InputType.TYPE_MASK_CLASS
+                      if (cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE) {
+                          showNumbers()
+                      } else {
+                          showLetters()
+                      }
+                  }
                   updateSuggestions()
               }
 
@@ -193,6 +197,55 @@ jobs:
                       InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
                       else -> false
                   }
+              }
+
+              // ---- صفحه‌ی حروف ----
+              private fun showLetters() {
+                  keysArea.removeAllViews()
+
+                  letterRows.forEach { row ->
+                      val line = newRow(50)
+                      row.forEach { ch -> line.addView(key(ch.toString(), 20f) { type(ch.toString()) }, weight(1f)) }
+                      keysArea.addView(line)
+                  }
+
+                  val bottom = newRow(50)
+                  bottom.addView(key("۱۲۳", 16f) { showNumbers() }, weight(1.3f))
+                  bottom.addView(key("،", 20f) { type("،") }, weight(1f))
+                  bottom.addView(key("نیم‌فاصله", 13f) { type("\u200c") }, weight(1.8f))
+                  bottom.addView(key("فاصله", 16f) { type(" ") }, weight(3f))
+                  bottom.addView(key(".", 20f) { type(".") }, weight(1f))
+                  bottom.addView(key("؟", 20f) { type("؟") }, weight(1f))
+                  bottom.addView(key("⌫", 20f) { backspace() }, weight(1.3f))
+                  bottom.addView(key("↵", 20f) { enter() }, weight(1.3f))
+                  keysArea.addView(bottom)
+              }
+
+              // ---- صفحه‌ی اعداد (درشت) ----
+              private fun showNumbers() {
+                  keysArea.removeAllViews()
+                  val h = 66
+                  val ts = 30f
+
+                  fun digitRow(a: String, b: String, c: String, lastLabel: String, lastAction: () -> Unit) {
+                      val line = newRow(h)
+                      line.addView(key(a, ts) { type(a) }, weight(1f))
+                      line.addView(key(b, ts) { type(b) }, weight(1f))
+                      line.addView(key(c, ts) { type(c) }, weight(1f))
+                      line.addView(key(lastLabel, if (lastLabel.length > 1) 18f else ts) { lastAction() }, weight(1f))
+                      keysArea.addView(line)
+                  }
+
+                  digitRow("۱", "۲", "۳", "⌫") { backspace() }
+                  digitRow("۴", "۵", "۶", "↵") { enter() }
+                  digitRow("۷", "۸", "۹", "فاصله") { type(" ") }
+
+                  val last = newRow(h)
+                  last.addView(key("ابج", 18f) { showLetters() }, weight(1f))
+                  last.addView(key("،", ts) { type("،") }, weight(1f))
+                  last.addView(key("۰", ts) { type("۰") }, weight(1f))
+                  last.addView(key(".", ts) { type(".") }, weight(1f))
+                  keysArea.addView(last)
               }
 
               // ---- ورودی ----
@@ -215,6 +268,7 @@ jobs:
 
               // ---- پیشنهادها ----
               private fun updateSuggestions() {
+                  if (!::suggestionBar.isInitialized) return
                   val before = currentInputConnection?.getTextBeforeCursor(30, 0)?.toString().orEmpty()
                   val items = suggest(before)
                   suggestionBar.removeAllViews()
@@ -234,22 +288,30 @@ jobs:
               private fun suggest(textBeforeCursor: String): List<String> = emptyList()
 
               // ---- ابزارهای UI ----
-              private fun newRow() = LinearLayout(this).apply {
+              private fun newRow(heightDp: Int) = LinearLayout(this).apply {
                   orientation = LinearLayout.HORIZONTAL
                   layoutDirection = View.LAYOUT_DIRECTION_RTL
                   layoutParams = LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT, dp(48)
+                      LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp)
                   )
               }
 
-              private fun key(label: String, onClick: () -> Unit) = Button(this).apply {
+              private fun key(label: String, size: Float, onClick: () -> Unit) = Button(this).apply {
                   text = label
                   isAllCaps = false
+                  textSize = size
+                  minWidth = 0
+                  minimumWidth = 0
+                  minHeight = 0
+                  minimumHeight = 0
+                  setPadding(0, 0, 0, 0)
                   setOnClickListener { onClick() }
               }
 
               private fun weight(w: Float) =
-                  LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, w)
+                  LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, w).apply {
+                      setMargins(dp(2), dp(2), dp(2), dp(2))
+                  }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
           }
