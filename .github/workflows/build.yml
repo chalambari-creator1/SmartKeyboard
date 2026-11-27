@@ -325,6 +325,336 @@ jobs:
           }
           KBEOF
           mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/SwipeLayout.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PointF
+          import android.graphics.RectF
+          import android.view.MotionEvent
+          import android.view.ViewGroup
+          import android.widget.LinearLayout
+          import kotlin.math.hypot
+
+          /**
+           * صفحه‌ی کلیدها. وقتی انگشت از روی یک حرف شروع به کشیدن کند (بیش از چند میلی‌متر)،
+           * لمس‌ها را می‌گیرد، مسیر را رسم می‌کند و در پایان مسیر را برای تشخیص کلمه می‌دهد.
+           * ضربه‌ی ساده و نگه‌داشتن کلید مثل قبل کار می‌کنند.
+           */
+          class SwipeLayout(context: Context) : LinearLayout(context) {
+
+              var swipeEnabled = false
+              var onSwipe: ((List<PointF>, List<Pair<Char, RectF>>) -> Unit)? = null
+
+              private val density = resources.displayMetrics.density
+              private val slop = 16f * density
+
+              private val path = ArrayList<PointF>()
+              private var swiping = false
+              private var armed = false
+              private var downX = 0f
+              private var downY = 0f
+
+              private val trail = Path()
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 5f * density
+                  strokeCap = Paint.Cap.ROUND
+                  strokeJoin = Paint.Join.ROUND
+                  color = 0xAA2196F3.toInt()
+              }
+
+              /** حروفی که تگ دارند (Char) و مستطیل هرکدام در مختصات همین View */
+              fun letterKeys(): List<Pair<Char, RectF>> {
+                  val out = ArrayList<Pair<Char, RectF>>()
+                  for (i in 0 until childCount) {
+                      val row = getChildAt(i) as? ViewGroup ?: continue
+                      for (j in 0 until row.childCount) {
+                          val v = row.getChildAt(j)
+                          val c = v.tag as? Char ?: continue
+                          out.add(
+                              c to RectF(
+                                  (row.left + v.left).toFloat(), (row.top + v.top).toFloat(),
+                                  (row.left + v.right).toFloat(), (row.top + v.bottom).toFloat()
+                              )
+                          )
+                      }
+                  }
+                  return out
+              }
+
+              private fun hitLetter(x: Float, y: Float) = letterKeys().any { it.second.contains(x, y) }
+
+              private fun addPoints(ev: MotionEvent) {
+                  for (h in 0 until ev.historySize) {
+                      path.add(PointF(ev.getHistoricalX(h), ev.getHistoricalY(h)))
+                  }
+                  path.add(PointF(ev.x, ev.y))
+              }
+
+              override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                  if (!swipeEnabled) return false
+                  when (ev.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          swiping = false
+                          path.clear()
+                          downX = ev.x
+                          downY = ev.y
+                          armed = hitLetter(ev.x, ev.y)
+                          if (armed) path.add(PointF(ev.x, ev.y))
+                      }
+                      MotionEvent.ACTION_MOVE -> if (armed && !swiping) {
+                          addPoints(ev)
+                          if (hypot(ev.x - downX, ev.y - downY) > slop) {
+                              swiping = true
+                              invalidate()
+                              return true
+                          }
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> armed = false
+                  }
+                  return swiping
+              }
+
+              override fun onTouchEvent(ev: MotionEvent): Boolean {
+                  if (!swiping) return super.onTouchEvent(ev)
+                  when (ev.actionMasked) {
+                      MotionEvent.ACTION_MOVE -> {
+                          addPoints(ev)
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          addPoints(ev)
+                          val pts = ArrayList(path)
+                          val keys = letterKeys()
+                          swiping = false
+                          armed = false
+                          path.clear()
+                          invalidate()
+                          onSwipe?.invoke(pts, keys)
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          swiping = false
+                          armed = false
+                          path.clear()
+                          invalidate()
+                      }
+                  }
+                  return true
+              }
+
+              override fun dispatchDraw(canvas: Canvas) {
+                  super.dispatchDraw(canvas)
+                  if (swiping && path.size > 1) {
+                      trail.reset()
+                      trail.moveTo(path[0].x, path[0].y)
+                      for (i in 1 until path.size) trail.lineTo(path[i].x, path[i].y)
+                      canvas.drawPath(trail, paint)
+                  }
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/SwipeDecoder.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          import android.content.Context
+          import android.graphics.PointF
+          import android.graphics.RectF
+          import kotlin.math.hypot
+          import kotlin.math.ln
+
+          /**
+           * تشخیص کلمه از روی مسیر انگشت: شکل مسیر با مسیر ایده‌آل هر کلمه (خط‌های بین مرکز حروف)
+           * مقایسه می‌شود. فرهنگ لغت: فایل‌های words_fa.txt / words_en.txt داخل assets (اگر دانلود شده باشند)،
+           * فهرست کوچک داخلی، و کلمه‌های جمله‌های ذخیره‌شده‌ی خود کاربر.
+           */
+          class SwipeDecoder(private val context: Context) {
+
+              private class Entry(val word: String, val keys: String, val rank: Int)
+
+              private val dicts = HashMap<String, List<Entry>>()
+
+              companion object {
+                  private const val N = 32
+
+                  // حروف روی صفحه‌کلید فارسی
+                  private const val FA_KEYS = "صثقفعهخحجچشسیبلاتنمپطزرودکگ"
+
+                  // حروفی که روی کلید جداگانه نیستند به کلید پایه‌شان نگاشت می‌شوند
+                  private val FA_BASE = mapOf(
+                      'ض' to 'ص', 'غ' to 'ع', 'ئ' to 'ی', 'ي' to 'ی', 'ى' to 'ی',
+                      'آ' to 'ا', 'أ' to 'ا', 'إ' to 'ا', 'ظ' to 'ط', 'ژ' to 'ز',
+                      'ذ' to 'د', 'ؤ' to 'و', 'ء' to 'گ', 'ة' to 'ه', 'ك' to 'ک'
+                  )
+
+                  private const val BUILTIN_FA =
+                      "و در به از که این را با است برای آن یک خود تا کرد بر هم نیز گفت شد دو ما من تو او شما ولی اما " +
+                      "اگر چون هر همه بود باید خیلی خوب سلام ممنون خداحافظ لطفا بله نه چی چرا کجا کی چطور الان امروز " +
+                      "فردا دیروز شب روز صبح عصر دوست خونه کار پول ماشین کتاب آب نون غذا دکتر بیمارستان بیمار پرستار " +
+                      "شیفت تشکر زحمت عزیز خانم آقا برادر خواهر مادر پدر بچه همین همون اینجا اونجا دیگه فقط حتما شاید " +
+                      "باشه ببخشید متشکرم سپاس"
+
+                  private const val BUILTIN_EN =
+                      "the be to of and in that have it for not on with he as you do at this but his by from they we say " +
+                      "her she or an will my one all would there their what so up out if about who get which go me when " +
+                      "make can like time no just him know take people into year your good some could them see other " +
+                      "than then now look only come its over think also back after use two how our work first well way " +
+                      "even new want because any these give day most us is are was were been has had did does hello " +
+                      "thanks please yes okay sorry love where why"
+              }
+
+              /** رشته‌ی کلیدهای صفحه‌کلید برای یک کلمه؛ null اگر کلمه حرف نامعتبر دارد */
+              private fun keysOf(word: String, fa: Boolean): String? {
+                  val sb = StringBuilder()
+                  for (ch in word) {
+                      if (fa) {
+                          val b = FA_BASE[ch] ?: ch
+                          if (FA_KEYS.indexOf(b) < 0) return null
+                          sb.append(b)
+                      } else {
+                          val c = ch.lowercaseChar()
+                          if (c == '\'') continue
+                          if (c !in 'a'..'z') return null
+                          sb.append(c)
+                      }
+                  }
+                  return if (sb.length >= 2) sb.toString() else null
+              }
+
+              @Synchronized
+              private fun dict(lang: String): List<Entry> {
+                  dicts[lang]?.let { return it }
+                  val fa = lang == "fa"
+                  val seen = HashSet<String>()
+                  val out = ArrayList<Entry>(60000)
+                  var rank = 0
+
+                  fun add(raw: String) {
+                      val w = raw.trim()
+                      if (w.isEmpty() || !seen.add(w)) return
+                      val k = keysOf(w, fa) ?: return
+                      out.add(Entry(w, k, rank++))
+                  }
+
+                  (if (fa) BUILTIN_FA else BUILTIN_EN).split(" ").forEach { add(it) }
+                  try {
+                      val name = if (fa) "words_fa.txt" else "words_en.txt"
+                      context.assets.open(name).bufferedReader(Charsets.UTF_8).useLines { lines ->
+                          for (line in lines) add(line.substringBefore(' '))
+                      }
+                  } catch (e: Exception) {
+                      // فایل فرهنگ لغت موجود نیست؛ فقط فهرست داخلی استفاده می‌شود
+                  }
+                  dicts[lang] = out
+                  return out
+              }
+
+              private fun pathLength(p: List<PointF>): Float {
+                  var s = 0f
+                  for (i in 1 until p.size) s += hypot(p[i].x - p[i - 1].x, p[i].y - p[i - 1].y)
+                  return s
+              }
+
+              /** نمونه‌برداری یکنواخت از مسیر به n نقطه (بر اساس طول مسیر) */
+              private fun resample(p: List<PointF>, n: Int): List<PointF> {
+                  val total = pathLength(p)
+                  if (total == 0f) return List(n) { p[0] }
+                  val step = total / (n - 1)
+                  val pts = ArrayList(p.map { PointF(it.x, it.y) })
+                  val out = ArrayList<PointF>(n)
+                  out.add(PointF(pts[0].x, pts[0].y))
+                  var d = 0f
+                  var i = 1
+                  while (i < pts.size) {
+                      val a = pts[i - 1]
+                      val b = pts[i]
+                      val seg = hypot(b.x - a.x, b.y - a.y)
+                      if (seg > 0f && d + seg >= step) {
+                          val t = (step - d) / seg
+                          val q = PointF(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y))
+                          out.add(q)
+                          pts.add(i, q)
+                          d = 0f
+                      } else {
+                          d += seg
+                      }
+                      i++
+                  }
+                  while (out.size < n) out.add(PointF(pts.last().x, pts.last().y))
+                  return out.take(n)
+              }
+
+              /** تا ۳ کلمه‌ی محتمل، از بهترین به بدترین */
+              fun decode(
+                  lang: String,
+                  path: List<PointF>,
+                  keys: List<Pair<Char, RectF>>,
+                  extraPhrases: List<String>
+              ): List<String> {
+                  if (path.size < 2 || keys.isEmpty()) return emptyList()
+                  val fa = lang == "fa"
+
+                  val centers = HashMap<Char, PointF>()
+                  var wSum = 0f
+                  for ((c, r) in keys) {
+                      centers[c] = PointF(r.centerX(), r.centerY())
+                      wSum += r.width()
+                  }
+                  val keyW = wSum / keys.size
+
+                  val userLen = pathLength(path)
+                  if (userLen < keyW * 0.8f) return emptyList()
+                  val user = resample(path, N)
+
+                  fun nearest(p: PointF): Set<Char> =
+                      centers.entries
+                          .sortedBy { hypot(it.value.x - p.x, it.value.y - p.y) }
+                          .take(3).map { it.key }.toSet()
+
+                  val starts = nearest(path.first())
+                  val ends = nearest(path.last())
+
+                  val best = ArrayList<Pair<Float, String>>()
+
+                  fun consider(e: Entry) {
+                      val k = e.keys
+                      if (k[0] !in starts || k[k.length - 1] !in ends) return
+                      val pts = ArrayList<PointF>(k.length)
+                      for (ch in k) {
+                          val c = centers[ch] ?: return
+                          if (pts.isEmpty() || pts[pts.size - 1] !== c) pts.add(c)
+                      }
+                      if (pts.size < 2) return
+                      val idealLen = pathLength(pts)
+                      if (idealLen < userLen * 0.45f || idealLen > userLen * 1.8f) return
+                      val ideal = resample(pts, N)
+                      var d = 0f
+                      for (i in 0 until N) d += hypot(user[i].x - ideal[i].x, user[i].y - ideal[i].y)
+                      d = d / N / keyW
+                      if (d > 2.0f) return
+                      val cost = d + 0.5f * (ln(1.0 + e.rank) / ln(60000.0)).toFloat()
+                      best.add(cost to e.word)
+                  }
+
+                  // کلمه‌های جمله‌های ذخیره‌شده‌ی خود کاربر بدون جریمه‌ی رتبه
+                  extraPhrases
+                      .flatMap { it.split(Regex("[^\\p{L}']+")) }
+                      .filter { it.length >= 2 }
+                      .distinct()
+                      .forEach { w -> keysOf(w, fa)?.let { consider(Entry(w, it, 0)) } }
+
+                  dict(lang).forEach { consider(it) }
+
+                  best.sortBy { it.first }
+                  return best.map { it.second }.distinct().take(3)
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
           cat > app/src/main/java/com/mohsenm/smartkeyboard/SmartKeyboardService.kt << 'KBEOF'
           package com.mohsenm.smartkeyboard
 
@@ -332,6 +662,8 @@ jobs:
           import android.content.Context
           import android.content.res.Configuration
           import android.graphics.Color
+          import android.graphics.PointF
+          import android.graphics.RectF
           import android.graphics.drawable.GradientDrawable
           import android.graphics.drawable.StateListDrawable
           import android.inputmethodservice.InputMethodService
@@ -350,6 +682,7 @@ jobs:
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
+          import java.util.concurrent.Executors
 
           class SmartKeyboardService : InputMethodService() {
 
@@ -366,16 +699,35 @@ jobs:
                       'ص' to 'ض', 'ع' to 'غ', 'ی' to 'ئ', 'ا' to 'آ',
                       'ط' to 'ظ', 'ز' to 'ژ', 'د' to 'ذ', 'و' to 'ؤ', 'گ' to 'ء'
                   )
+
+                  // دسته‌های ایموجی (آیکون تب، فهرست ایموجی‌ها با فاصله از هم جدا شده)
+                  private val EMOJI_CATS = listOf(
+                      "🕘" to "",
+                      "😀" to "😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 🙃 😉 😌 😍 🥰 😘 😗 😙 😚 😋 😛 😝 😜 🤪 🤨 🧐 🤓 😎 🥳 😏 😒 😞 😔 😟 😕 🙁 😣 😖 😫 😩 🥺 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 😰 😥 😓 🤗 🤔 🤭 🤫 🤥 😶 😐 😑 😬 🙄 😯 😦 😧 😮 😲 🥱 😴 🤤 😪 😵 🤐 🥴 🤢 🤮 🤧 😷 🤒 🤕",
+                      "👍" to "👍 👎 👌 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ ✋ 🤚 🖐️ 🖖 👋 🤝 🙏 ✍️ 💪 👏 🙌 👐 🤲 ❤️ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣️ 💕 💞 💓 💗 💖 💘 💝 💯 ✨ ⭐ 🌟 🔥 💥 🎉 🎊",
+                      "🐱" to "🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🐔 🐧 🐦 🐤 🦆 🦅 🦉 🐺 🐴 🦄 🐝 🦋 🐌 🐞 🐢 🐍 🐙 🐬 🐳 🐟 🌹 🌷 🌸 🌻 🌼 🌲 🌴 🍀 🌍 🌙 ☀️ ⛅ ☁️ 🌧️ ❄️ ⚡ 🌈",
+                      "🍎" to "🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🍒 🍑 🥭 🍍 🥝 🍅 🥑 🍆 🥕 🌽 🥔 🍞 🧀 🍳 🥞 🍔 🍟 🍕 🌭 🥪 🌮 🍗 🍖 🍚 🍜 🍝 🍣 🍦 🍩 🍪 🎂 🍰 🍫 🍬 ☕ 🍵 🥤 🍺",
+                      "⚽" to "⚽ 🏀 🏈 🎮 🎧 🎵 🎶 📱 💻 📷 📚 ✏️ 📌 📎 🔑 🔒 💡 💰 💳 🎁 🕌 🚗 ✈️ 🏠 ⏰ ✅ ❌ ❓ ❗ ⚠️ ➕ ➖ ✔️ 💬 👀"
+                  )
               }
 
               private var learningEnabled = true
               private var lang = "fa"        // "fa" یا "en"
               private var shift = false
+              private var emojiCat = 1
 
               private lateinit var suggestionBar: LinearLayout
-              private lateinit var keysArea: LinearLayout
+              private lateinit var keysArea: SwipeLayout
               private val store by lazy { PhraseStore(applicationContext) }
               private val handler = Handler(Looper.getMainLooper())
+              private val flashReset = Runnable { updateSuggestions() }
+
+              // swipe typing
+              private val executor = Executors.newSingleThreadExecutor()
+              private val decoder by lazy { SwipeDecoder(applicationContext) }
+              private var swipeChips: List<String> = emptyList()
+              private var swipeCommitted = ""
+              private val prefs by lazy { getSharedPreferences("kb", Context.MODE_PRIVATE) }
 
               private var clipboard: ClipboardManager? = null
               private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { captureClip() }
@@ -401,6 +753,7 @@ jobs:
 
               override fun onDestroy() {
                   clipboard?.removePrimaryClipChangedListener(clipListener)
+                  executor.shutdown()
                   super.onDestroy()
               }
 
@@ -420,10 +773,11 @@ jobs:
                   ))
 
                   // محل نمایش صفحه‌ی کلیدها؛ چیدمان از چپ به راست مثل کیبورد واقعی
-                  keysArea = LinearLayout(this).apply {
+                  keysArea = SwipeLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       layoutDirection = View.LAYOUT_DIRECTION_LTR
                       setPadding(dp(3), 0, dp(3), dp(4))
+                      onSwipe = { pts, keys -> handleSwipe(pts, keys) }
                   }
                   root.addView(keysArea)
 
@@ -436,6 +790,7 @@ jobs:
                   super.onStartInputView(info, restarting)
                   // در فیلد رمز عبور و فیلدهای حساس ذخیره و پیشنهاد خاموش است
                   learningEnabled = !isSensitiveField(info)
+                  swipeChips = emptyList()
                   captureClip()
 
                   // در فیلدهای عددی/تلفن مستقیم صفحه‌ی اعداد باز می‌شود
@@ -466,7 +821,7 @@ jobs:
 
               // ---- صفحه‌ی حروف ----
               private fun showLetters() {
-                  keysArea.removeAllViews()
+                  resetKeys(learningEnabled)   // سوایپ فقط در صفحه‌ی حروف (و نه در فیلد رمز) فعال است
                   val rows = if (fa) FA_ROWS else EN_ROWS
 
                   keysArea.addView(letterRow(rows[0], 0f))
@@ -490,8 +845,7 @@ jobs:
                       showLetters()
                   }, weight(1.1f))
                   b.addView(keyWithAlt(if (fa) "،" else ",", "!", 20f) { type(if (fa) "،" else ",") }, weight(1f))
-                  if (fa) b.addView(key("نیم‌فاصله", 11f, true) { type("\u200c") }, weight(1.6f))
-                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(if (fa) 3f else 4.6f))
+                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(4.6f))
                   b.addView(keyWithAlt(".", if (fa) "؟" else "?", 20f) { type(".") }, weight(1f))
                   b.addView(key("↵", 20f, true) { enter() }, weight(1.5f))
                   keysArea.addView(b)
@@ -514,10 +868,12 @@ jobs:
                   }
                   // اگر شیفت روشن است، دیگر حرف جایگزین جداگانه نشان داده نمی‌شود
                   val hint = if (alt != null && !shift) alt.toString() else null
-                  return keyWithAlt(shown.toString(), hint, 20f) {
+                  val v = keyWithAlt(shown.toString(), hint, 20f) {
                       type(shown.toString())
                       if (shift) { shift = false; showLetters() }
                   }
+                  v.tag = base   // برای تشخیص موقعیت حروف در سوایپ
+                  return v
               }
 
               /** کلید با حرف جایگزین: نگه‌داشتن کلید، حرف کوچک گوشه‌ی کلید را وارد می‌کند. */
@@ -542,7 +898,7 @@ jobs:
 
               // ---- صفحه‌ی اعداد (درشت؛ همیشه اعداد لاتین) ----
               private fun showNumbers() {
-                  keysArea.removeAllViews()
+                  resetKeys(false)
                   val h = 66
                   val ts = 30f
                   val d = "1234567890"
@@ -585,16 +941,25 @@ jobs:
               }
 
               private fun type(text: String) {
+                  swipeChips = emptyList()
                   currentInputConnection?.commitText(normalizeDigits(text), 1)
                   updateSuggestions()
               }
 
               private fun backspace() {
-                  currentInputConnection?.deleteSurroundingText(1, 0)
+                  swipeChips = emptyList()
+                  val ic = currentInputConnection ?: return
+                  val selected = ic.getSelectedText(0)
+                  if (!selected.isNullOrEmpty()) {
+                      ic.commitText("", 1)                       // متن انتخاب‌شده پاک می‌شود
+                  } else {
+                      ic.deleteSurroundingTextInCodePoints(1, 0) // یک کاراکتر (ایموجی هم کامل پاک می‌شود)
+                  }
                   updateSuggestions()
               }
 
               private fun enter() {
+                  swipeChips = emptyList()
                   currentInputConnection?.apply {
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
@@ -643,8 +1008,8 @@ jobs:
                   }, LinearLayout.LayoutParams(
                       LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT
                   ))
-                  handler.removeCallbacksAndMessages(null)
-                  handler.postDelayed({ updateSuggestions() }, 1800)
+                  handler.removeCallbacks(flashReset)
+                  handler.postDelayed(flashReset, 1800)
               }
 
               // ---- کلیپ‌بورد ----
@@ -684,6 +1049,7 @@ jobs:
                       }
                       suggestionBar.addView(b, weight(1f))
                   }
+                  tool("😀") { showEmoji() }
                   tool("📋") { showClips() }
                   tool("📝") { showSaved() }
                   tool("⭐") { saveCurrent() }
@@ -693,6 +1059,25 @@ jobs:
               private fun updateSuggestions() {
                   if (!::suggestionBar.isInitialized) return
                   suggestionBar.removeAllViews()
+
+                  // بعد از سوایپ: کلمه‌های محتمل (لمس هر کدام، کلمه‌ی وارد‌شده را عوض می‌کند)
+                  if (swipeChips.isNotEmpty()) {
+                      swipeChips.forEach { w ->
+                          suggestionBar.addView(TextView(this).apply {
+                              text = w
+                              setTextColor(cText)
+                              background = roundBg(cKey)
+                              textSize = 16f
+                              gravity = Gravity.CENTER
+                              maxLines = 1
+                              ellipsize = TextUtils.TruncateAt.END
+                              setPadding(dp(8), 0, dp(8), 0)
+                              setOnClickListener { applySwipeChoice(w) }
+                          }, weight(1f))
+                      }
+                      return
+                  }
+
                   if (!learningEnabled) { addToolbar(); return }
 
                   val before = currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty()
@@ -745,7 +1130,7 @@ jobs:
                   extraLabel: String? = null,
                   onExtra: (() -> Unit)? = null
               ) {
-                  keysArea.removeAllViews()
+                  resetKeys(false)
                   val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   if (rows.isEmpty()) {
                       list.addView(TextView(this).apply {
@@ -845,6 +1230,128 @@ jobs:
                   }
               }
 
+              // ---- صفحه‌ی ایموجی ----
+              private fun recentEmoji(): List<String> =
+                  prefs.getString("recent_emoji", "").orEmpty().split(" ").filter { it.isNotEmpty() }
+
+              private fun addRecentEmoji(e: String) {
+                  val list = (listOf(e) + recentEmoji().filter { it != e }).take(24)
+                  prefs.edit().putString("recent_emoji", list.joinToString(" ")).apply()
+              }
+
+              private fun showEmoji() {
+                  resetKeys(false)
+
+                  // تب‌های دسته‌بندی
+                  val tabs = newRow(44)
+                  EMOJI_CATS.forEachIndexed { i, c ->
+                      val t = Button(this).apply {
+                          text = c.first
+                          textSize = 20f
+                          isAllCaps = false
+                          minWidth = 0
+                          minimumWidth = 0
+                          minHeight = 0
+                          minimumHeight = 0
+                          setPadding(0, 0, 0, 0)
+                          stateListAnimator = null
+                          setTextColor(cText)
+                          if (i == emojiCat) background = roundBg(cSpecial) else setBackgroundColor(Color.TRANSPARENT)
+                          setOnClickListener { emojiCat = i; showEmoji() }
+                      }
+                      tabs.addView(t, weight(1f))
+                  }
+                  keysArea.addView(tabs)
+
+                  // شبکه‌ی ایموجی‌ها (۸ تا در هر ردیف)
+                  val items = if (emojiCat == 0) recentEmoji()
+                  else EMOJI_CATS[emojiCat].second.split(" ").filter { it.isNotEmpty() }
+
+                  val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  if (items.isEmpty()) {
+                      grid.addView(TextView(this).apply {
+                          text = "هنوز ایموجی‌ای استفاده نکرده‌ای."
+                          setTextColor(cHint)
+                          textSize = 15f
+                          gravity = Gravity.CENTER
+                      }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(120)))
+                  }
+                  items.chunked(8).forEach { chunk ->
+                      val row = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          layoutDirection = View.LAYOUT_DIRECTION_LTR
+                      }
+                      chunk.forEach { e ->
+                          row.addView(TextView(this).apply {
+                              text = e
+                              textSize = 26f
+                              gravity = Gravity.CENTER
+                              setOnClickListener {
+                                  currentInputConnection?.commitText(e, 1)
+                                  addRecentEmoji(e)
+                              }
+                          }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+                      }
+                      repeat(8 - chunk.size) {
+                          row.addView(View(this), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+                      }
+                      grid.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(46)))
+                  }
+                  val scroll = ScrollView(this)
+                  scroll.addView(grid)
+                  keysArea.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(176)))
+
+                  // ردیف پایین: برگشت، فاصله، پاک‌کردن
+                  val bottom = newRow(52)
+                  bottom.addView(key(if (fa) "ابج" else "ABC", 18f, true) { showLetters(); updateSuggestions() }, weight(1.5f))
+                  bottom.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(4f))
+                  bottom.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
+                  keysArea.addView(bottom)
+              }
+
+              // ---- سوایپ ----
+              private fun handleSwipe(path: List<PointF>, keys: List<Pair<Char, RectF>>) {
+                  val language = lang
+                  val extra = store.all()
+                  executor.execute {
+                      val words = try {
+                          decoder.decode(language, path, keys, extra)
+                      } catch (e: Exception) {
+                          emptyList()
+                      }
+                      handler.post { applySwipeResult(words) }
+                  }
+              }
+
+              private fun applySwipeResult(words: List<String>) {
+                  if (words.isEmpty()) { flash(if (fa) "کلمه‌ای پیدا نشد" else "No word found"); return }
+                  val ic = currentInputConnection ?: return
+                  val list = if (shift && !fa) words.map { w -> w.replaceFirstChar { it.uppercaseChar() } } else words
+                  if (shift) { shift = false; showLetters() }
+
+                  // اگر درست بعد از یک حرف هستیم، اول یک فاصله بگذار
+                  val prev = ic.getTextBeforeCursor(1, 0)?.toString().orEmpty()
+                  val prefix = if (prev.isNotEmpty() && !prev[0].isWhitespace()) " " else ""
+
+                  ic.commitText(prefix + list[0] + " ", 1)
+                  swipeCommitted = list[0]
+                  swipeChips = list
+                  updateSuggestions()
+              }
+
+              private fun applySwipeChoice(w: String) {
+                  val ic = currentInputConnection ?: return
+                  ic.deleteSurroundingText(swipeCommitted.length + 1, 0)
+                  ic.commitText("$w ", 1)
+                  swipeCommitted = w
+                  updateSuggestions()
+              }
+
+              private fun resetKeys(swipe: Boolean) {
+                  keysArea.removeAllViews()
+                  keysArea.swipeEnabled = swipe
+              }
+
               // ---- ابزارهای UI ----
               private fun roundBg(color: Int) = GradientDrawable().apply {
                   setColor(color)
@@ -919,6 +1426,13 @@ jobs:
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
           }
           KBEOF
+
+      - name: Download word lists (dictionary for swipe typing)
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fsSL "https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/fa/fa_50k.txt" -o app/src/main/assets/words_fa.txt || curl -fsSL "https://huggingface.co/datasets/StephanAkkerman/frequency-words-2018/resolve/main/fa/fa_50k.txt" -o app/src/main/assets/words_fa.txt || echo "Persian word list NOT downloaded"
+          curl -fsSL "https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/en/en_50k.txt" -o app/src/main/assets/words_en.txt || curl -fsSL "https://huggingface.co/datasets/StephanAkkerman/frequency-words-2018/resolve/main/en/en_50k.txt" -o app/src/main/assets/words_en.txt || echo "English word list NOT downloaded"
+          wc -l app/src/main/assets/*.txt || true
 
       - uses: actions/setup-java@v4
         with:
