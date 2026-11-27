@@ -117,29 +117,129 @@ jobs:
           </resources>
           KBEOF
           mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/SecretBox.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import java.security.KeyStore
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+
+          /** رمزگذاری با کلیدی که داخل Android Keystore ساخته می‌شود و از گوشی خارج نمی‌شود. */
+          object SecretBox {
+              private const val ALIAS = "smartkb_vault_key"
+
+              private fun key(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                  (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+                  val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  kg.init(
+                      KeyGenParameterSpec.Builder(
+                          ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                      )
+                          .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                          .setKeySize(256)
+                          .build()
+                  )
+                  return kg.generateKey()
+              }
+
+              fun encrypt(plain: String): ByteArray {
+                  val c = Cipher.getInstance("AES/GCM/NoPadding")
+                  c.init(Cipher.ENCRYPT_MODE, key())
+                  val ct = c.doFinal(plain.toByteArray(Charsets.UTF_8))
+                  return c.iv + ct
+              }
+
+              fun decrypt(data: ByteArray): String {
+                  val iv = data.copyOfRange(0, 12)
+                  val c = Cipher.getInstance("AES/GCM/NoPadding")
+                  c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv))
+                  return String(c.doFinal(data, 12, data.size - 12), Charsets.UTF_8)
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
           cat > app/src/main/java/com/mohsenm/smartkeyboard/PhraseStore.kt << 'KBEOF'
           package com.mohsenm.smartkeyboard
 
+          import android.content.ContentValues
           import android.content.Context
           import android.database.sqlite.SQLiteDatabase
           import android.database.sqlite.SQLiteOpenHelper
 
-          /** حافظه‌ی لوکال جمله‌ها؛ فقط روی همین گوشی ذخیره می‌شود. */
-          class PhraseStore(context: Context) : SQLiteOpenHelper(context, "phrases.db", null, 1) {
+          /** جمله‌های ذخیره‌شده، کلیپ‌بورد و گاوصندوق؛ فقط روی همین گوشی نگهداری می‌شود. */
+          class PhraseStore(context: Context) : SQLiteOpenHelper(context, "phrases.db", null, 3) {
 
               override fun onCreate(db: SQLiteDatabase) {
+                  createPhrases(db)
+                  createVault(db)
+                  createClips(db)
+              }
+
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+                  if (oldVersion < 2) {
+                      db.execSQL("DROP TABLE IF EXISTS phrases")
+                      createPhrases(db)
+                  }
+                  if (oldVersion < 3) {
+                      createVault(db)
+                      createClips(db)
+                  }
+              }
+
+              private fun createPhrases(db: SQLiteDatabase) = db.execSQL(
+                  "CREATE TABLE IF NOT EXISTS phrases (text TEXT PRIMARY KEY, cnt INTEGER NOT NULL, last INTEGER NOT NULL)"
+              )
+
+              private fun createVault(db: SQLiteDatabase) = db.execSQL(
+                  "CREATE TABLE IF NOT EXISTS vault (id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                      "label TEXT NOT NULL, secret BLOB NOT NULL, created INTEGER NOT NULL)"
+              )
+
+              private fun createClips(db: SQLiteDatabase) = db.execSQL(
+                  "CREATE TABLE IF NOT EXISTS clips (text TEXT PRIMARY KEY, ts INTEGER NOT NULL)"
+              )
+
+              // ---------- جمله‌های ذخیره‌شده ----------
+
+              /** true اگر جمله‌ی جدیدی اضافه شد، false اگر از قبل بود */
+              fun add(text: String): Boolean {
+                  val db = writableDatabase
+                  db.rawQuery("SELECT 1 FROM phrases WHERE text = ?", arrayOf(text)).use { c ->
+                      if (c.moveToFirst()) return false
+                  }
                   db.execSQL(
-                      "CREATE TABLE phrases (text TEXT PRIMARY KEY, cnt INTEGER NOT NULL, last INTEGER NOT NULL)"
+                      "INSERT INTO phrases(text, cnt, last) VALUES(?, 0, ?)",
+                      arrayOf<Any>(text, System.currentTimeMillis())
+                  )
+                  return true
+              }
+
+              fun delete(text: String) {
+                  writableDatabase.execSQL("DELETE FROM phrases WHERE text = ?", arrayOf<Any>(text))
+              }
+
+              /** هر بار که جمله استفاده شد، امتیازش بالا می‌رود تا در پیشنهادها جلوتر بیاید */
+              fun use(text: String) {
+                  writableDatabase.execSQL(
+                      "UPDATE phrases SET cnt = cnt + 1, last = ? WHERE text = ?",
+                      arrayOf<Any>(System.currentTimeMillis(), text)
                   )
               }
 
-              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
-
-              fun learn(text: String) {
-                  val now = System.currentTimeMillis()
-                  val db = writableDatabase
-                  db.execSQL("UPDATE phrases SET cnt = cnt + 1, last = ? WHERE text = ?", arrayOf<Any>(now, text))
-                  db.execSQL("INSERT OR IGNORE INTO phrases(text, cnt, last) VALUES(?, 1, ?)", arrayOf<Any>(text, now))
+              fun all(): List<String> {
+                  val out = ArrayList<String>()
+                  readableDatabase.rawQuery(
+                      "SELECT text FROM phrases ORDER BY cnt DESC, last DESC", null
+                  ).use { c ->
+                      while (c.moveToNext()) out.add(c.getString(0))
+                  }
+                  return out
               }
 
               fun suggest(prefix: String, limit: Int): List<String> {
@@ -157,22 +257,98 @@ jobs:
                   }
                   return out
               }
+
+              // ---------- کلیپ‌بورد ----------
+
+              fun clipAdd(text: String) {
+                  val db = writableDatabase
+                  db.execSQL(
+                      "INSERT OR REPLACE INTO clips(text, ts) VALUES(?, ?)",
+                      arrayOf<Any>(text, System.currentTimeMillis())
+                  )
+                  // فقط ۳۰ مورد آخر نگه داشته می‌شود
+                  db.execSQL(
+                      "DELETE FROM clips WHERE text NOT IN (SELECT text FROM clips ORDER BY ts DESC LIMIT 30)"
+                  )
+              }
+
+              fun clipList(): List<String> {
+                  val out = ArrayList<String>()
+                  readableDatabase.rawQuery("SELECT text FROM clips ORDER BY ts DESC", null).use { c ->
+                      while (c.moveToNext()) out.add(c.getString(0))
+                  }
+                  return out
+              }
+
+              fun clipDelete(text: String) {
+                  writableDatabase.execSQL("DELETE FROM clips WHERE text = ?", arrayOf<Any>(text))
+              }
+
+              fun clipClear() {
+                  writableDatabase.execSQL("DELETE FROM clips")
+              }
+
+              // ---------- گاوصندوق (رمزگذاری‌شده) ----------
+
+              fun vaultAdd(label: String, secret: String) {
+                  val cv = ContentValues().apply {
+                      put("label", label)
+                      put("secret", SecretBox.encrypt(secret))
+                      put("created", System.currentTimeMillis())
+                  }
+                  writableDatabase.insert("vault", null, cv)
+              }
+
+              /** فهرست (شناسه، برچسب)؛ خود مقدار محرمانه اینجا خوانده نمی‌شود */
+              fun vaultList(): List<Pair<Long, String>> {
+                  val out = ArrayList<Pair<Long, String>>()
+                  readableDatabase.rawQuery("SELECT id, label FROM vault ORDER BY id DESC", null).use { c ->
+                      while (c.moveToNext()) out.add(Pair(c.getLong(0), c.getString(1)))
+                  }
+                  return out
+              }
+
+              fun vaultSecret(id: Long): String? {
+                  readableDatabase.rawQuery(
+                      "SELECT secret FROM vault WHERE id = ?", arrayOf(id.toString())
+                  ).use { c ->
+                      if (c.moveToFirst()) {
+                          return try { SecretBox.decrypt(c.getBlob(0)) } catch (e: Exception) { null }
+                      }
+                  }
+                  return null
+              }
+
+              fun vaultDelete(id: Long) {
+                  writableDatabase.execSQL("DELETE FROM vault WHERE id = ?", arrayOf<Any>(id))
+              }
           }
           KBEOF
           mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
           cat > app/src/main/java/com/mohsenm/smartkeyboard/SmartKeyboardService.kt << 'KBEOF'
           package com.mohsenm.smartkeyboard
 
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.res.Configuration
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.StateListDrawable
           import android.inputmethodservice.InputMethodService
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
           import android.text.InputType
           import android.text.TextUtils
           import android.view.Gravity
           import android.view.KeyEvent
+          import android.view.MotionEvent
           import android.view.View
           import android.view.inputmethod.EditorInfo
           import android.widget.Button
           import android.widget.FrameLayout
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
 
           class SmartKeyboardService : InputMethodService() {
@@ -199,39 +375,68 @@ jobs:
               private lateinit var suggestionBar: LinearLayout
               private lateinit var keysArea: LinearLayout
               private val store by lazy { PhraseStore(applicationContext) }
+              private val handler = Handler(Looper.getMainLooper())
 
-              private val fa get() = lang == "fa"
+              private var clipboard: ClipboardManager? = null
+              private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { captureClip() }
+
+              private val fa: Boolean get() = lang == "fa"
+
+              // ---- رنگ‌ها (روشن/تیره مثل سامسونگ) ----
+              private val dark: Boolean
+                  get() = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                      Configuration.UI_MODE_NIGHT_YES
+              private val cBg: Int get() = if (dark) 0xFF1C1C1E.toInt() else 0xFFEEEFF3.toInt()
+              private val cKey: Int get() = if (dark) 0xFF3A3A3C.toInt() else 0xFFFFFFFF.toInt()
+              private val cSpecial: Int get() = if (dark) 0xFF2C2C2E.toInt() else 0xFFD9DBE1.toInt()
+              private val cPressed: Int get() = if (dark) 0xFF58585B.toInt() else 0xFFC4C7CF.toInt()
+              private val cText: Int get() = if (dark) 0xFFF2F2F2.toInt() else 0xFF111111.toInt()
+              private val cHint: Int get() = if (dark) 0xFF9A9AA0.toInt() else 0xFF8A8F98.toInt()
+
+              override fun onCreate() {
+                  super.onCreate()
+                  clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                  clipboard?.addPrimaryClipChangedListener(clipListener)
+              }
+
+              override fun onDestroy() {
+                  clipboard?.removePrimaryClipChangedListener(clipListener)
+                  super.onDestroy()
+              }
 
               override fun onCreateInputView(): View {
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(0xFF263238.toInt())
+                      setBackgroundColor(cBg)
                   }
 
-                  // نوار پیشنهاد
+                  // نوار بالا: ابزارها یا پیشنهادها
                   suggestionBar = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
-                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                      layoutDirection = View.LAYOUT_DIRECTION_LTR
                   }
                   root.addView(suggestionBar, LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT, dp(44)
+                      LinearLayout.LayoutParams.MATCH_PARENT, dp(46)
                   ))
 
                   // محل نمایش صفحه‌ی کلیدها؛ چیدمان از چپ به راست مثل کیبورد واقعی
                   keysArea = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       layoutDirection = View.LAYOUT_DIRECTION_LTR
+                      setPadding(dp(3), 0, dp(3), dp(4))
                   }
                   root.addView(keysArea)
 
                   showLetters()
+                  updateSuggestions()
                   return root
               }
 
               override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
                   super.onStartInputView(info, restarting)
-                  // در فیلد رمز عبور و فیلدهای حساس یادگیری خاموش است
+                  // در فیلد رمز عبور و فیلدهای حساس ذخیره و پیشنهاد خاموش است
                   learningEnabled = !isSensitiveField(info)
+                  captureClip()
 
                   // در فیلدهای عددی/تلفن مستقیم صفحه‌ی اعداد باز می‌شود
                   if (::keysArea.isInitialized) {
@@ -267,33 +472,33 @@ jobs:
                   keysArea.addView(letterRow(rows[0], 0f))
                   keysArea.addView(letterRow(rows[1], if (fa) 0f else 0.5f))
 
-                  // ردیف سوم: شیفت + حروف + پاک‌کردن
-                  val r3 = newRow(50)
-                  val shiftKey = key(if (shift) "⬆" else "⇧", 20f) { shift = !shift; showLetters() }
-                  if (shift) shiftKey.setBackgroundColor(0xFF90A4AE.toInt())
+                  // ردیف سوم: شیفت + حروف + پاک‌کردن (با نگه‌داشتن، تکرار می‌شود)
+                  val r3 = newRow(52)
+                  val shiftKey = key(if (shift) "⬆" else "⇧", 20f, true) { shift = !shift; showLetters() }
+                  if (shift) shiftKey.background = keyBg(0xFF90A4AE.toInt(), cPressed)
                   r3.addView(shiftKey, weight(1.5f))
                   rows[2].forEach { r3.addView(letterKey(it), weight(1f)) }
-                  r3.addView(key("⌫", 20f) { backspace() }, weight(1.5f))
+                  r3.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
                   keysArea.addView(r3)
 
                   // ردیف پایین
-                  val b = newRow(50)
-                  b.addView(key(if (fa) "۱۲۳" else "123", 15f) { showNumbers() }, weight(1.3f))
-                  b.addView(key("🌐", 18f) {
+                  val b = newRow(52)
+                  b.addView(key("123", 15f, true) { showNumbers() }, weight(1.3f))
+                  b.addView(key("🌐", 18f, true) {
                       lang = if (fa) "en" else "fa"
                       shift = false
                       showLetters()
                   }, weight(1.1f))
                   b.addView(keyWithAlt(if (fa) "،" else ",", "!", 20f) { type(if (fa) "،" else ",") }, weight(1f))
-                  if (fa) b.addView(key("نیم‌فاصله", 11f) { type("\u200c") }, weight(1.6f))
+                  if (fa) b.addView(key("نیم‌فاصله", 11f, true) { type("\u200c") }, weight(1.6f))
                   b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(if (fa) 3f else 4.6f))
                   b.addView(keyWithAlt(".", if (fa) "؟" else "?", 20f) { type(".") }, weight(1f))
-                  b.addView(key("↵", 20f) { enter() }, weight(1.5f))
+                  b.addView(key("↵", 20f, true) { enter() }, weight(1.5f))
                   keysArea.addView(b)
               }
 
               private fun letterRow(chars: String, spacer: Float): LinearLayout {
-                  val line = newRow(50)
+                  val line = newRow(52)
                   if (spacer > 0f) line.addView(View(this), weight(spacer))
                   chars.forEach { line.addView(letterKey(it), weight(1f)) }
                   if (spacer > 0f) line.addView(View(this), weight(spacer))
@@ -317,7 +522,7 @@ jobs:
 
               /** کلید با حرف جایگزین: نگه‌داشتن کلید، حرف کوچک گوشه‌ی کلید را وارد می‌کند. */
               private fun keyWithAlt(label: String, alt: String?, size: Float, onClick: () -> Unit): View {
-                  val btn = key(label, size, onClick)
+                  val btn = key(label, size, false, onClick)
                   if (alt == null) return btn
                   btn.setOnLongClickListener { type(alt); true }
                   val frame = FrameLayout(this)
@@ -327,20 +532,20 @@ jobs:
                   frame.addView(TextView(this).apply {
                       text = alt
                       textSize = 10f
-                      setTextColor(0xFF607D8B.toInt())
+                      setTextColor(cHint)
                   }, FrameLayout.LayoutParams(
                       FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-                      Gravity.TOP or Gravity.END
-                  ).apply { setMargins(0, dp(2), dp(6), 0) })
+                      Gravity.TOP or Gravity.START
+                  ).apply { setMargins(dp(6), dp(2), 0, 0) })
                   return frame
               }
 
-              // ---- صفحه‌ی اعداد (درشت) ----
+              // ---- صفحه‌ی اعداد (درشت؛ همیشه اعداد لاتین) ----
               private fun showNumbers() {
                   keysArea.removeAllViews()
                   val h = 66
                   val ts = 30f
-                  val d = if (fa) "۱۲۳۴۵۶۷۸۹۰" else "1234567890"
+                  val d = "1234567890"
                   val comma = if (fa) "،" else ","
 
                   fun digitRow(a: Char, b: Char, c: Char, lastLabel: String, lastAction: () -> Unit) {
@@ -348,7 +553,8 @@ jobs:
                       line.addView(key(a.toString(), ts) { type(a.toString()) }, weight(1f))
                       line.addView(key(b.toString(), ts) { type(b.toString()) }, weight(1f))
                       line.addView(key(c.toString(), ts) { type(c.toString()) }, weight(1f))
-                      line.addView(key(lastLabel, if (lastLabel.length > 1) 18f else ts) { lastAction() }, weight(1f))
+                      val special = lastLabel.length == 1 || lastLabel == "فاصله" || lastLabel == "space"
+                      line.addView(key(lastLabel, if (lastLabel.length > 1) 18f else ts, special) { lastAction() }, weight(1f))
                       keysArea.addView(line)
                   }
 
@@ -357,7 +563,7 @@ jobs:
                   digitRow(d[6], d[7], d[8], if (fa) "فاصله" else "space") { type(" ") }
 
                   val last = newRow(h)
-                  last.addView(key(if (fa) "ابج" else "ABC", 18f) { showLetters() }, weight(1f))
+                  last.addView(key(if (fa) "ابج" else "ABC", 18f, true) { showLetters() }, weight(1f))
                   last.addView(key(comma, ts) { type(comma) }, weight(1f))
                   last.addView(key(d[9].toString(), ts) { type(d[9].toString()) }, weight(1f))
                   last.addView(key(".", ts) { type(".") }, weight(1f))
@@ -365,10 +571,21 @@ jobs:
               }
 
               // ---- ورودی ----
+              /** اعداد فارسی/عربی همیشه به لاتین تبدیل می‌شوند */
+              private fun normalizeDigits(s: String): String = buildString {
+                  for (ch in s) {
+                      append(
+                          when (ch) {
+                              in '۰'..'۹' -> '0' + (ch - '۰')
+                              in '٠'..'٩' -> '0' + (ch - '٠')
+                              else -> ch
+                          }
+                      )
+                  }
+              }
+
               private fun type(text: String) {
-                  // پایان جمله: جمله‌ی تمام‌شده را یاد بگیر
-                  if (text.length == 1 && SENTENCE_END.contains(text[0])) learnCurrentSegment()
-                  currentInputConnection?.commitText(text, 1)
+                  currentInputConnection?.commitText(normalizeDigits(text), 1)
                   updateSuggestions()
               }
 
@@ -378,7 +595,6 @@ jobs:
               }
 
               private fun enter() {
-                  learnCurrentSegment()
                   currentInputConnection?.apply {
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
                       sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
@@ -386,63 +602,260 @@ jobs:
                   updateSuggestions()
               }
 
-              // ---- یادگیری ----
+              // ---- متن فیلد / ذخیره‌ی دستی ----
               /** متن جمله‌ی جاری: از آخرین نقطه/علامت پایان جمله یا خط جدید تا مکان‌نما */
               private fun currentSegment(before: String): String {
                   val idx = before.indexOfLast { it == '\n' || SENTENCE_END.contains(it) }
                   return if (idx >= 0) before.substring(idx + 1) else before
               }
 
-              private fun isLearnable(s: String): Boolean {
-                  if (s.length < 6 || s.length > 120) return false
-                  if (LONG_DIGITS.containsMatchIn(s)) return false   // شماره کارت/تلفن و ... یاد گرفته نشود
-                  if (s.contains('@') || s.contains("http", ignoreCase = true)) return false
-                  return true
+              /** متن انتخاب‌شده؛ اگر چیزی انتخاب نشده باشد، کل متن داخل فیلد. */
+              private fun readFieldText(): String {
+                  val ic = currentInputConnection ?: return ""
+                  val selected = ic.getSelectedText(0)?.toString()
+                  return (
+                      if (!selected.isNullOrBlank()) selected
+                      else ic.getTextBeforeCursor(300, 0)?.toString().orEmpty() +
+                          ic.getTextAfterCursor(300, 0)?.toString().orEmpty()
+                  ).trim()
               }
 
-              private fun learnCurrentSegment() {
-                  if (!learningEnabled) return
-                  val before = currentInputConnection?.getTextBeforeCursor(200, 0)?.toString() ?: return
-                  val seg = currentSegment(before).trim()
-                  if (isLearnable(seg)) store.learn(seg)
+              private fun saveCurrent() {
+                  if (!learningEnabled) { flash("اینجا ذخیره نمی‌شود"); return }
+                  val text = normalizeDigits(readFieldText())
+                  when {
+                      text.length < 2 -> flash("اول متن را بنویس، بعد ⭐")
+                      text.length > 200 -> flash("متن خیلی بلند است (حداکثر ۲۰۰ حرف)")
+                      LONG_DIGITS.containsMatchIn(text) -> flash("شماره‌ی بلند را از 💳 ذخیره کن")
+                      store.add(text) -> flash("✓ ذخیره شد")
+                      else -> flash("قبلاً ذخیره شده")
+                  }
               }
 
-              // ---- پیشنهادها ----
+              private fun flash(msg: String) {
+                  if (!::suggestionBar.isInitialized) return
+                  suggestionBar.removeAllViews()
+                  suggestionBar.addView(TextView(this).apply {
+                      text = msg
+                      setTextColor(if (dark) 0xFFFFEB3B.toInt() else 0xFF8A5A00.toInt())
+                      textSize = 14f
+                      gravity = Gravity.CENTER
+                  }, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT
+                  ))
+                  handler.removeCallbacksAndMessages(null)
+                  handler.postDelayed({ updateSuggestions() }, 1800)
+              }
+
+              // ---- کلیپ‌بورد ----
+              private fun captureClip() {
+                  try {
+                      val cm = clipboard ?: return
+                      val clip = cm.primaryClip ?: return
+                      if (clip.itemCount == 0) return
+                      // محتوایی که خود برنامه «حساس» علامت زده (مثل رمزها) ذخیره نمی‌شود
+                      if (Build.VERSION.SDK_INT >= 33 &&
+                          clip.description.extras?.getBoolean("android.content.extra.IS_SENSITIVE", false) == true
+                      ) return
+                      val t = clip.getItemAt(0).coerceToText(this)?.toString()?.trim().orEmpty()
+                      if (t.isEmpty() || t.length > 500) return
+                      store.clipAdd(t)
+                  } catch (e: Exception) {
+                      // دسترسی به کلیپ‌بورد ممکن است در بعضی حالت‌ها رد شود؛ مهم نیست
+                  }
+              }
+
+              // ---- نوار بالا: ابزارها یا پیشنهادها ----
+              private fun addToolbar() {
+                  fun tool(icon: String, action: () -> Unit) {
+                      val b = Button(this).apply {
+                          text = icon
+                          textSize = 20f
+                          isAllCaps = false
+                          minWidth = 0
+                          minimumWidth = 0
+                          minHeight = 0
+                          minimumHeight = 0
+                          setPadding(0, 0, 0, 0)
+                          setBackgroundColor(Color.TRANSPARENT)
+                          stateListAnimator = null
+                          setTextColor(cText)
+                          setOnClickListener { action() }
+                      }
+                      suggestionBar.addView(b, weight(1f))
+                  }
+                  tool("📋") { showClips() }
+                  tool("📝") { showSaved() }
+                  tool("⭐") { saveCurrent() }
+                  tool("💳") { showVault() }
+              }
+
               private fun updateSuggestions() {
                   if (!::suggestionBar.isInitialized) return
                   suggestionBar.removeAllViews()
-                  if (!learningEnabled) return
+                  if (!learningEnabled) { addToolbar(); return }
 
                   val before = currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty()
-                  val prefix = currentSegment(before).trimStart()
-                  if (prefix.length < 2) return
+                  val line = before.substringAfterLast('\n')
 
-                  store.suggest(prefix, 3).forEach { s ->
+                  // اول با کل خط تطبیق می‌دهیم، بعد با جمله‌ی جاری
+                  var raw = ""
+                  var found: List<String> = emptyList()
+                  for (cand in listOf(line, currentSegment(before)).distinct()) {
+                      val p = cand.trimStart()
+                      if (p.length < 2) continue
+                      val r = store.suggest(p, 3)
+                      if (r.isNotEmpty()) { raw = cand; found = r; break }
+                  }
+
+                  if (found.isEmpty()) { addToolbar(); return }
+
+                  found.forEach { s ->
                       suggestionBar.addView(TextView(this).apply {
                           text = s
-                          setTextColor(0xFFFFFFFF.toInt())
-                          setBackgroundColor(0xFF37474F.toInt())
+                          setTextColor(cText)
+                          background = roundBg(cKey)
                           textSize = 15f
                           gravity = Gravity.CENTER
                           maxLines = 1
                           ellipsize = TextUtils.TruncateAt.END
                           setPadding(dp(8), 0, dp(8), 0)
-                          setOnClickListener { applySuggestion(s) }
+                          setOnClickListener { applySuggestion(raw, s) }
                       }, weight(1f))
                   }
               }
 
-              private fun applySuggestion(phrase: String) {
+              private fun applySuggestion(raw: String, phrase: String) {
                   val ic = currentInputConnection ?: return
-                  val before = ic.getTextBeforeCursor(200, 0)?.toString().orEmpty()
-                  val seg = currentSegment(before)
-                  val lead = seg.takeWhile { it == ' ' }
-                  ic.deleteSurroundingText(seg.length, 0)
+                  val lead = raw.takeWhile { it == ' ' }
+                  ic.deleteSurroundingText(raw.length, 0)
                   ic.commitText(lead + phrase, 1)
+                  store.use(phrase)
                   updateSuggestions()
               }
 
+              // ---- صفحه‌های فهرست (جمله‌ها / کلیپ‌بورد / گاوصندوق) ----
+              private class Row(val key: String, val label: String)
+
+              private fun showListPage(
+                  emptyMsg: String,
+                  rows: List<Row>,
+                  onPick: (Row) -> Unit,
+                  onDelete: (Row) -> Unit,
+                  extraLabel: String? = null,
+                  onExtra: (() -> Unit)? = null
+              ) {
+                  keysArea.removeAllViews()
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  if (rows.isEmpty()) {
+                      list.addView(TextView(this).apply {
+                          text = emptyMsg
+                          setTextColor(cHint)
+                          textSize = 15f
+                          gravity = Gravity.CENTER
+                      }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(120)))
+                  }
+                  rows.forEach { r ->
+                      val row = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          layoutDirection = View.LAYOUT_DIRECTION_LTR
+                      }
+                      row.addView(key("🗑", 16f, true) { onDelete(r) }, smallKeyParams())
+                      val k = key(r.label, 15f) { onPick(r) }.apply {
+                          maxLines = 1
+                          ellipsize = TextUtils.TruncateAt.END
+                          setPadding(dp(10), 0, dp(10), 0)
+                      }
+                      row.addView(k, weight(1f))
+                      list.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(50)))
+                  }
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(list)
+                  keysArea.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(200)))
+
+                  val bottom = newRow(52)
+                  bottom.addView(key(if (fa) "ابج" else "ABC", 18f, true) { showLetters(); updateSuggestions() }, weight(1f))
+                  if (extraLabel != null && onExtra != null) {
+                      bottom.addView(key(extraLabel, 14f) { onExtra() }, weight(2.2f))
+                  }
+                  keysArea.addView(bottom)
+              }
+
+              private fun commitAndClose(text: String) {
+                  currentInputConnection?.commitText(text, 1)
+                  showLetters()
+                  updateSuggestions()
+              }
+
+              private fun showSaved() {
+                  showListPage(
+                      "هنوز چیزی ذخیره نکرده‌ای.\nمتن را بنویس و ⭐ را بزن.",
+                      store.all().map { Row(it, it) },
+                      onPick = { store.use(it.key); commitAndClose(it.key) },
+                      onDelete = { store.delete(it.key); showSaved() }
+                  )
+              }
+
+              private fun showClips() {
+                  captureClip()
+                  showListPage(
+                      "کلیپ‌بورد خالی است.\nچیزی را کپی کن تا اینجا بیاید.",
+                      store.clipList().map { Row(it, it.replace("\n", " ")) },
+                      onPick = { r -> commitAndClose(store.clipList().firstOrNull { it.replace("\n", " ") == r.label } ?: r.label) },
+                      onDelete = { r ->
+                          store.clipList().firstOrNull { it.replace("\n", " ") == r.label }?.let { store.clipDelete(it) }
+                          showClips()
+                      },
+                      extraLabel = "پاک‌کردن همه",
+                      onExtra = { store.clipClear(); showClips() }
+                  )
+              }
+
+              private fun showVault() {
+                  showListPage(
+                      "گاوصندوق خالی است.\nشماره را بنویس و «افزودن» را بزن.",
+                      store.vaultList().map { Row(it.first.toString(), it.second) },
+                      onPick = { r ->
+                          val secret = store.vaultSecret(r.key.toLong())
+                          if (secret != null) commitAndClose(secret) else flash("خواندن ناموفق بود")
+                      },
+                      onDelete = { store.vaultDelete(it.key.toLong()); showVault() },
+                      extraLabel = "➕ افزودن از متن فیلد",
+                      onExtra = { addToVault() }
+                  )
+              }
+
+              private fun addToVault() {
+                  if (!learningEnabled) { flash("اینجا ذخیره نمی‌شود"); return }
+                  val text = normalizeDigits(readFieldText())
+                  if (text.length < 2) { flash("اول شماره را در فیلد بنویس"); return }
+                  if (text.length > 64) { flash("حداکثر ۶۴ حرف"); return }
+                  store.vaultAdd(vaultLabel(text), text)
+                  flash("✓ در گاوصندوق ذخیره شد")
+                  showVault()
+              }
+
+              private fun vaultLabel(text: String): String {
+                  val digits = text.filter { it in '0'..'9' }
+                  return if (digits.length in 13..19 && digits.length >= text.length - 4) {
+                      "کارت ····" + digits.takeLast(4)
+                  } else {
+                      text.take(14) + if (text.length > 14) "…" else ""
+                  }
+              }
+
               // ---- ابزارهای UI ----
+              private fun roundBg(color: Int) = GradientDrawable().apply {
+                  setColor(color)
+                  cornerRadius = dp(9).toFloat()
+              }
+
+              private fun keyBg(color: Int, pressed: Int) = StateListDrawable().apply {
+                  addState(intArrayOf(android.R.attr.state_pressed), roundBg(pressed))
+                  addState(intArrayOf(), roundBg(color))
+              }
+
               private fun newRow(heightDp: Int) = LinearLayout(this).apply {
                   orientation = LinearLayout.HORIZONTAL
                   layoutDirection = View.LAYOUT_DIRECTION_LTR
@@ -451,21 +864,56 @@ jobs:
                   )
               }
 
-              private fun key(label: String, size: Float, onClick: () -> Unit) = Button(this).apply {
-                  text = label
-                  isAllCaps = false
-                  textSize = size
-                  minWidth = 0
-                  minimumWidth = 0
-                  minHeight = 0
-                  minimumHeight = 0
-                  setPadding(0, 0, 0, 0)
-                  setOnClickListener { onClick() }
+              private fun key(label: String, size: Float, special: Boolean = false, onClick: () -> Unit) =
+                  Button(this).apply {
+                      text = label
+                      isAllCaps = false
+                      textSize = size
+                      minWidth = 0
+                      minimumWidth = 0
+                      minHeight = 0
+                      minimumHeight = 0
+                      setPadding(0, 0, 0, 0)
+                      setTextColor(cText)
+                      background = keyBg(if (special) cSpecial else cKey, cPressed)
+                      stateListAnimator = null
+                      setOnClickListener { onClick() }
+                  }
+
+              /** کلیدی که با نگه‌داشتن، مرتب تکرار می‌شود (مثل پاک‌کردن) */
+              private fun repeatKey(label: String, size: Float, action: () -> Unit): Button {
+                  val b = key(label, size, true) {}
+                  val repeater = object : Runnable {
+                      override fun run() {
+                          action()
+                          handler.postDelayed(this, 55)
+                      }
+                  }
+                  b.setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              v.isPressed = true
+                              action()
+                              handler.postDelayed(repeater, 400)
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              v.isPressed = false
+                              handler.removeCallbacks(repeater)
+                          }
+                      }
+                      true
+                  }
+                  return b
               }
 
               private fun weight(w: Float) =
                   LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, w).apply {
-                      setMargins(dp(2), dp(2), dp(2), dp(2))
+                      setMargins(dp(3), dp(4), dp(3), dp(0))
+                  }
+
+              private fun smallKeyParams() =
+                  LinearLayout.LayoutParams(dp(48), LinearLayout.LayoutParams.MATCH_PARENT).apply {
+                      setMargins(dp(3), dp(4), dp(3), dp(0))
                   }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
