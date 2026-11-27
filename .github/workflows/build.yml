@@ -2,30 +2,14 @@ name: Build APK
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: smartkeyboard-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses
-
-      - name: Install Android SDK packages
-        run: sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
 
       - name: Generate project files
         run: |
@@ -779,6 +763,7 @@ jobs:
 
               override fun onDestroy() {
                   clipboard?.removePrimaryClipChangedListener(clipListener)
+                  handler.removeCallbacks(clipPoll)
                   executor.shutdown()
                   super.onDestroy()
               }
@@ -818,6 +803,8 @@ jobs:
                   learningEnabled = !isSensitiveField(info)
                   swipeChips = emptyList()
                   captureClip()
+                  handler.removeCallbacks(clipPoll)
+                  handler.postDelayed(clipPoll, 1500)
 
                   // در فیلدهای عددی/تلفن مستقیم صفحه‌ی اعداد باز می‌شود
                   if (::keysArea.isInitialized) {
@@ -829,6 +816,11 @@ jobs:
                       }
                   }
                   updateSuggestions()
+              }
+
+              override fun onFinishInputView(finishingInput: Boolean) {
+                  handler.removeCallbacks(clipPoll)
+                  super.onFinishInputView(finishingInput)
               }
 
               private fun isSensitiveField(info: EditorInfo?): Boolean {
@@ -863,19 +855,11 @@ jobs:
                   keysArea.addView(r3)
 
                   // ردیف پایین
-                  val b = newRow(52)
-                  b.addView(key("!#1", 15f, true) { showSymbols(1) }, weight(1.3f))
-                  b.addView(key("123", 14f, true) { showNumbers() }, weight(1.2f))
-                  b.addView(key("🌐", 18f, true) {
+                  keysArea.addView(bottomRow("!#1", 15f, { showSymbols(1) }) {
                       lang = if (fa) "en" else "fa"
                       shift = false
                       showLetters()
-                  }, weight(1.1f))
-                  b.addView(keyWithAlt(if (fa) "،" else ",", "!", 20f) { type(if (fa) "،" else ",") }, weight(1f))
-                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(3.4f))
-                  b.addView(keyWithAlt(".", if (fa) "؟" else "?", 20f) { type(".") }, weight(1f))
-                  b.addView(key("↵", 20f, true) { enter() }, weight(1.5f))
-                  keysArea.addView(b)
+                  })
               }
 
               private fun letterRow(chars: String, spacer: Float): LinearLayout {
@@ -1047,20 +1031,37 @@ jobs:
               }
 
               // ---- کلیپ‌بورد ----
-              private fun captureClip() {
+              private var lastClipStatus = ""
+
+              private val clipPoll = object : Runnable {
+                  override fun run() {
+                      captureClip()
+                      handler.postDelayed(this, 1500)
+                  }
+              }
+
+              /** آخرین کپی را در تاریخچه می‌گذارد. اگر نشد، علتش در lastClipStatus می‌ماند. */
+              private fun captureClip(): Boolean {
                   try {
-                      val cm = clipboard ?: return
-                      val clip = cm.primaryClip ?: return
-                      if (clip.itemCount == 0) return
+                      val cm = clipboard
+                      if (cm == null) { lastClipStatus = "سرویس کلیپ‌بورد در دسترس نیست"; return false }
+                      if (!cm.hasPrimaryClip()) { lastClipStatus = "چیزی کپی نشده است"; return false }
+                      val clip = cm.primaryClip
+                      if (clip == null) { lastClipStatus = "اندروید اجازه‌ی خواندن کلیپ‌بورد را نداد"; return false }
+                      if (clip.itemCount == 0) { lastClipStatus = "محتوای کپی‌شده خالی است"; return false }
                       // محتوایی که خود برنامه «حساس» علامت زده (مثل رمزها) ذخیره نمی‌شود
                       if (Build.VERSION.SDK_INT >= 33 &&
                           clip.description.extras?.getBoolean("android.content.extra.IS_SENSITIVE", false) == true
-                      ) return
+                      ) { lastClipStatus = "آخرین کپی «حساس» علامت خورده و ذخیره نمی‌شود"; return false }
                       val t = clip.getItemAt(0).coerceToText(this)?.toString()?.trim().orEmpty()
-                      if (t.isEmpty() || t.length > 500) return
+                      if (t.isEmpty()) { lastClipStatus = "آخرین کپی متن نیست"; return false }
+                      if (t.length > 2000) { lastClipStatus = "آخرین کپی خیلی بلند است (بیش از ۲۰۰۰ حرف)"; return false }
                       store.clipAdd(t)
+                      lastClipStatus = ""
+                      return true
                   } catch (e: Exception) {
-                      // دسترسی به کلیپ‌بورد ممکن است در بعضی حالت‌ها رد شود؛ مهم نیست
+                      lastClipStatus = "خطا در خواندن کلیپ‌بورد: " + (e.message ?: e.javaClass.simpleName)
+                      return false
                   }
               }
 
@@ -1087,6 +1088,7 @@ jobs:
                   tool("📋") { showClips() }
                   tool("📝") { showSaved() }
                   tool("⭐") { saveCurrent() }
+                  tool("🔢") { showNumbers() }
                   tool("💳") { showVault() }
               }
 
@@ -1217,10 +1219,13 @@ jobs:
               }
 
               private fun showClips() {
-                  captureClip()
+                  val ok = captureClip()
+                  val rows = store.clipList()
+                  val empty = "کلیپ‌بورد خالی است.\n" +
+                      (if (lastClipStatus.isNotEmpty()) lastClipStatus else "چیزی را کپی کن تا اینجا بیاید.")
                   showListPage(
-                      "کلیپ‌بورد خالی است.\nچیزی را کپی کن تا اینجا بیاید.",
-                      store.clipList().map { Row(it, it.replace("\n", " ")) },
+                      empty,
+                      rows.map { Row(it, it.replace("\n", " ")) },
                       onPick = { r -> commitAndClose(store.clipList().firstOrNull { it.replace("\n", " ") == r.label } ?: r.label) },
                       onDelete = { r ->
                           store.clipList().firstOrNull { it.replace("\n", " ") == r.label }?.let { store.clipDelete(it) }
@@ -1229,6 +1234,8 @@ jobs:
                       extraLabel = "پاک‌کردن همه",
                       onExtra = { store.clipClear(); showClips() }
                   )
+                  // اگر خواندن کلیپ‌بورد مشکل داشت، علتش بالای کیبورد هم نشان داده می‌شود
+                  if (!ok && lastClipStatus.isNotEmpty() && rows.isNotEmpty()) flash(lastClipStatus)
               }
 
               private fun showVault() {
@@ -1422,18 +1429,33 @@ jobs:
                   r4.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
                   keysArea.addView(r4)
 
-                  val b = newRow(52)
-                  b.addView(key(if (fa) "اب" else "ABC", 16f, true) { showLetters(); updateSuggestions() }, weight(1.3f))
-                  b.addView(key("🌐", 18f, true) {
+                  keysArea.addView(bottomRow(if (fa) "اب" else "ABC", 16f, { showLetters(); updateSuggestions() }) {
                       lang = if (fa) "en" else "fa"
                       shift = false
                       showSymbols(page)
-                  }, weight(1.1f))
-                  b.addView(key(if (fa) "،" else ",", 20f) { type(if (fa) "،" else ",") }, weight(1f))
-                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(4.6f))
-                  b.addView(key(".", 20f) { type(".") }, weight(1f))
+                  })
+              }
+
+              /**
+               * ردیف پایین مثل سامسونگ، متقارن تا کلید فاصله دقیقاً وسط باشد:
+               * [چپ][🌐][،] [فاصله] [نیم‌فاصله][.][اینتر]
+               */
+              private fun bottomRow(leftLabel: String, leftSize: Float, onLeft: () -> Unit, onLang: () -> Unit): LinearLayout {
+                  val b = newRow(52)
+                  b.addView(key(leftLabel, leftSize, true) { onLeft() }, weight(1.4f))
+                  b.addView(key("🌐", 18f, true) { onLang() }, weight(1.1f))
+                  b.addView(keyWithAlt(if (fa) "،" else ",", "!", 20f) { type(if (fa) "،" else ",") }, weight(1f))
+                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(3.5f))
+                  if (fa) {
+                      // کلید سمت راست فاصله: نیم‌فاصله (ZWNJ)
+                      b.addView(key("↔", 18f, true) { type("\u200c") }, weight(1f))
+                      b.addView(keyWithAlt(".", "؟", 20f) { type(".") }, weight(1f))
+                  } else {
+                      b.addView(key("?", 20f) { type("?") }, weight(1f))
+                      b.addView(key(".", 20f) { type(".") }, weight(1f))
+                  }
                   b.addView(key("↵", 20f, true) { enter() }, weight(1.5f))
-                  keysArea.addView(b)
+                  return b
               }
 
               // ---- ابزارهای UI ----
@@ -1528,10 +1550,9 @@ jobs:
           gradle-version: 8.9
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: gradle assembleDebug --no-daemon
 
       - uses: actions/upload-artifact@v4
         with:
           name: smart-keyboard-apk
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
