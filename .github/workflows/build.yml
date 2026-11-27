@@ -81,6 +81,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <!-- عمداً پرمیشن INTERNET نداریم: داده‌ها از گوشی خارج نمی‌شوند -->
               <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <application
                   android:label="@string/app_name"
                   android:allowBackup="false"
@@ -96,6 +97,20 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <service
+                      android:name=".CodeListenerService"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+                  <receiver
+                      android:name=".CopyReceiver"
+                      android:exported="false" />
 
                   <service
                       android:name=".SmartKeyboardService"
@@ -929,11 +944,14 @@ jobs:
                   @Suppress("DEPRECATION")
                   vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
                   audio = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                  // وقتی کد تازه‌ای از اعلان‌ها رسید، نوار بالا تازه می‌شود
+                  CodeInbox.onNew = { handler.post { updateSuggestions() } }
               }
 
               override fun onDestroy() {
                   clipboard?.removePrimaryClipChangedListener(clipListener)
                   handler.removeCallbacks(clipPoll)
+                  CodeInbox.onNew = null
                   executor.shutdown()
                   super.onDestroy()
               }
@@ -1447,6 +1465,7 @@ jobs:
                   tool("✂️") { showEdit() }
                   tool("🔢") { showNumbers() }
                   tool("💳") { showVault() }
+                  tool("🔑") { showCodes() }
                   tool("⚙️") { openSettings() }
               }
 
@@ -1478,6 +1497,36 @@ jobs:
 
                   val before = currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty()
                   val line = before.substringAfterLast('\n')
+
+                  // کد/شماره‌ی تازه از اعلان‌ها: وقتی فیلد خالی است، با یک ضربه وارد و کپی می‌شود
+                  if (before.isBlank() && KbSettings.codes(this)) {
+                      val fresh = CodeInbox.fresh().take(2)
+                      if (fresh.isNotEmpty()) {
+                          fresh.forEach { it0 ->
+                              suggestionBar.addView(TextView(this).apply {
+                                  text = "🔑 " + it0.value
+                                  setTextColor(0xFFFFFFFF.toInt())
+                                  background = roundBg(accent)
+                                  textSize = 17f
+                                  gravity = Gravity.CENTER
+                                  maxLines = 1
+                                  setPadding(dp(8), 0, dp(8), 0)
+                                  setOnClickListener {
+                                      feedback()
+                                      copyText(it0.value)
+                                      currentInputConnection?.commitText(it0.value, 1)
+                                      CodeInbox.dismissFresh()
+                                      updateSuggestions()
+                                  }
+                              }, weight(1.5f))
+                          }
+                          suggestionBar.addView(key("✕", 16f, true) {
+                              CodeInbox.dismissFresh()
+                              updateSuggestions()
+                          }, weight(0.6f))
+                          return
+                      }
+                  }
 
                   // اول با کل خط تطبیق می‌دهیم، بعد با جمله‌ی جاری
                   var raw = ""
@@ -1543,7 +1592,8 @@ jobs:
                   onDelete: (Row) -> Unit,
                   extraLabel: String? = null,
                   onExtra: (() -> Unit)? = null,
-                  onPin: ((Row) -> Unit)? = null
+                  onPin: ((Row) -> Unit)? = null,
+                  pinLabel: String = "📌"
               ) {
                   resetKeys(false)
                   val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -1562,7 +1612,7 @@ jobs:
                       }
                       row.addView(key("🗑", 16f, true) { onDelete(r) }, smallKeyParams())
                       if (onPin != null) {
-                          val pin = key("📌", 16f, true) { onPin(r) }
+                          val pin = key(pinLabel, 16f, true) { onPin(r) }
                           if (r.pinned) pin.background = keyBg(accent, cPressed)
                           row.addView(pin, smallKeyParams())
                       }
@@ -1632,6 +1682,31 @@ jobs:
                       onDelete = { store.vaultDelete(it.key.toLong()); showVault() },
                       extraLabel = "➕ افزودن از متن فیلد",
                       onExtra = { addToVault() }
+                  )
+              }
+
+              private fun copyText(t: String) {
+                  try {
+                      val clip = android.content.ClipData.newPlainText("kb", t)
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          clip.description.extras = android.os.PersistableBundle().apply {
+                              putBoolean("android.content.extra.IS_SENSITIVE", true)
+                          }
+                      }
+                      clipboard?.setPrimaryClip(clip)
+                  } catch (e: Exception) { }
+              }
+
+              private fun showCodes() {
+                  showListPage(
+                      "هنوز کد یا شماره‌ای نرسیده.\nدر تنظیمات کیبورد «دسترسی به اعلان‌ها» را روشن کن.",
+                      CodeInbox.recent().map { Row(it.value, it.kind + ": " + it.value) },
+                      onPick = { r -> copyText(r.key); commitAndClose(r.key) },
+                      onDelete = { r -> CodeInbox.remove(r.key); showCodes() },
+                      extraLabel = "پاک‌کردن همه",
+                      onExtra = { CodeInbox.clear(); showCodes() },
+                      onPin = { r -> copyText(r.key); flash("✓ کپی شد") },
+                      pinLabel = "📋"
                   )
               }
 
@@ -2107,6 +2182,14 @@ jobs:
               fun learn(c: Context) = prefs(c).getBoolean("learn", true)
               fun setLearn(c: Context, v: Boolean) = prefs(c).edit().putBoolean("learn", v).apply()
 
+              /** نمایش کد و شماره‌ی اعلان‌ها (نیاز به دسترسی اعلان‌ها دارد) */
+              fun codes(c: Context) = prefs(c).getBoolean("codes", true)
+              fun setCodes(c: Context, v: Boolean) = prefs(c).edit().putBoolean("codes", v).apply()
+
+              /** اعلان «ضربه بزن تا کپی شود» */
+              fun codeNotify(c: Context) = prefs(c).getBoolean("code_notify", true)
+              fun setCodeNotify(c: Context, v: Boolean) = prefs(c).edit().putBoolean("code_notify", v).apply()
+
               fun swipe(c: Context) = prefs(c).getBoolean("swipe", true)
               fun setSwipe(c: Context, v: Boolean) = prefs(c).edit().putBoolean("swipe", v).apply()
 
@@ -2461,6 +2544,7 @@ jobs:
           import android.content.Intent
           import android.content.res.Configuration
           import android.graphics.drawable.GradientDrawable
+          import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.view.Gravity
@@ -2571,6 +2655,34 @@ jobs:
                       })
                   }
 
+                  // ---- کد و شماره از اعلان‌ها ----
+                  section("کد و شماره از اعلان‌ها")
+                  card {
+                      addView(switchRow("نشان‌دادن کد و شماره‌ی پیامک/اعلان‌ها در کیبورد", KbSettings.codes(this@SettingsActivity)) {
+                          KbSettings.setCodes(this@SettingsActivity, it)
+                      })
+                      addView(switchRow("اعلان «ضربه بزن تا کپی شود»", KbSettings.codeNotify(this@SettingsActivity)) { on ->
+                          KbSettings.setCodeNotify(this@SettingsActivity, on)
+                          if (on && Build.VERSION.SDK_INT >= 33 &&
+                              checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+                          ) {
+                              requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 11)
+                          }
+                      })
+                      addView(label(if (listenerEnabled()) "دسترسی به اعلان‌ها: فعال ✓" else "دسترسی به اعلان‌ها: غیرفعال ✗"))
+                      addView(actionButton("دادن دسترسی به اعلان‌ها") {
+                          startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                      })
+                      addView(TextView(this@SettingsActivity).apply {
+                          text = "کد (مثل رمز یک‌بارمصرف) و شماره‌های بلند (تلفن، کارت، حساب) از اعلان‌های رسیده پیدا می‌شوند. " +
+                              "فقط ۱۰ دقیقه در حافظه‌ی همین گوشی می‌مانند و جایی ذخیره یا ارسال نمی‌شوند. " +
+                              "اگر اندروید ۱۳ به بالا دارید و گزینه خاکستری بود: تنظیمات ← برنامه‌ها ← کیبورد هوشمند ← ⋮ ← «مجاز کردن تنظیمات محدودشده»."
+                          setTextColor(cHint)
+                          textSize = 12f
+                          setPadding(dp(4), dp(6), dp(4), 0)
+                      })
+                  }
+
                   // ---- یادگیری ----
                   section("یادگیری از نوشته‌های من")
                   card {
@@ -2614,6 +2726,11 @@ jobs:
                           setPadding(dp(4), dp(6), dp(4), 0)
                       })
                   }
+              }
+
+              private fun listenerEnabled(): Boolean {
+                  val s = Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: return false
+                  return s.contains(packageName)
               }
 
               // ---------- ابزارهای ساخت UI ----------
@@ -2752,6 +2869,198 @@ jobs:
                       line.addView(dot, LinearLayout.LayoutParams(dp(44), dp(44)).apply { setMargins(dp(8), 0, dp(8), 0) })
                   }
                   return line
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/CodeInbox.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          /** کدها و شماره‌هایی که از اعلان‌ها پیدا شده‌اند؛ فقط در حافظه‌ی گوشی و فقط چند دقیقه نگه‌داشته می‌شوند. */
+          object CodeInbox {
+              class Item(val value: String, val kind: String, val ts: Long)
+
+              private const val KEEP_MS = 10 * 60 * 1000L
+              private const val FRESH_MS = 2 * 60 * 1000L
+
+              private val items = ArrayList<Item>()
+              private var dismissedAt = 0L
+
+              /** وقتی کد تازه‌ای رسید، کیبورد صدا زده می‌شود تا نوار بالا را تازه کند. */
+              @Volatile var onNew: (() -> Unit)? = null
+
+              @Synchronized
+              fun add(value: String, kind: String) {
+                  val now = System.currentTimeMillis()
+                  items.removeAll { it.value == value }
+                  items.add(0, Item(value, kind, now))
+                  while (items.size > 8) items.removeAt(items.size - 1)
+                  onNew?.invoke()
+              }
+
+              @Synchronized
+              fun recent(): List<Item> {
+                  val limit = System.currentTimeMillis() - KEEP_MS
+                  items.removeAll { it.ts < limit }
+                  return ArrayList(items)
+              }
+
+              /** موردهای خیلی تازه که هنوز کنار زده نشده‌اند (برای نمایش خودکار روی نوار بالا) */
+              @Synchronized
+              fun fresh(): List<Item> {
+                  val limit = maxOf(System.currentTimeMillis() - FRESH_MS, dismissedAt)
+                  return recent().filter { it.ts > limit }
+              }
+
+              @Synchronized fun dismissFresh() { dismissedAt = System.currentTimeMillis() }
+
+              @Synchronized fun remove(value: String) { items.removeAll { it.value == value } }
+
+              @Synchronized fun clear() { items.clear() }
+          }
+
+          /** پیدا کردن کد (مثل رمز یک‌بارمصرف) و شماره (تلفن، کارت، حساب…) از متن اعلان */
+          object CodeExtractor {
+              private val KEYWORDS = Regex(
+                  "کد|رمز|پین|تایید|تأیید|تاييد|پویا|code|otp|pin|verification|password|passcode",
+                  RegexOption.IGNORE_CASE
+              )
+              private val CARD = Regex("""(?<!\d)(\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4})(?!\d)""")
+              private val NUM = Regex("""(?<![\d/:])\d{4,16}(?![\d/:])""")
+
+              private fun normalizeDigits(s: String): String = buildString {
+                  for (ch in s) {
+                      append(
+                          when (ch) {
+                              in '۰'..'۹' -> '0' + (ch - '۰')
+                              in '٠'..'٩' -> '0' + (ch - '٠')
+                              else -> ch
+                          }
+                      )
+                  }
+              }
+
+              /** فهرست (مقدار، نوع)؛ نوع یا «کد» است یا «شماره» */
+              fun extract(raw: String): List<Pair<String, String>> {
+                  var text = normalizeDigits(raw)
+                  val hasKw = KEYWORDS.containsMatchIn(text)
+                  val out = ArrayList<Pair<String, String>>()
+
+                  for (m in CARD.findAll(text)) {
+                      out.add(m.groupValues[1].filter { it.isDigit() } to "شماره")
+                  }
+                  text = CARD.replace(text, " ")
+
+                  for (m in NUM.findAll(text)) {
+                      val v = m.value
+                      when {
+                          v.length <= 8 && hasKw -> out.add(v to "کد")
+                          v.length >= 8 -> out.add(v to "شماره")
+                      }
+                  }
+                  // کدها اول بیایند
+                  return out.distinctBy { it.first }.sortedBy { if (it.second == "کد") 0 else 1 }.take(3)
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/mohsenm/smartkeyboard
+          cat > app/src/main/java/com/mohsenm/smartkeyboard/CodeListenerService.kt << 'KBEOF'
+          package com.mohsenm.smartkeyboard
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.os.PersistableBundle
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.widget.Toast
+
+          /**
+           * متن اعلان‌های رسیده (پیامک، تلگرام، بانک…) را می‌خواند، کد یا شماره را پیدا می‌کند و
+           * یک اعلان کوچک «ضربه بزن تا کپی شود» نشان می‌دهد. چیزی ذخیره یا ارسال نمی‌شود.
+           */
+          class CodeListenerService : NotificationListenerService() {
+
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  try {
+                      sbn ?: return
+                      if (sbn.packageName == packageName) return
+                      if (!KbSettings.codes(this)) return
+                      val n = sbn.notification ?: return
+                      if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+                      if (n.flags and Notification.FLAG_ONGOING_EVENT != 0) return
+
+                      val ex = n.extras ?: return
+                      val text = listOfNotNull(
+                          ex.getCharSequence(Notification.EXTRA_TITLE),
+                          ex.getCharSequence(Notification.EXTRA_TEXT),
+                          ex.getCharSequence(Notification.EXTRA_BIG_TEXT)
+                      ).joinToString("\n")
+                      if (text.isBlank()) return
+
+                      val found = CodeExtractor.extract(text)
+                      if (found.isEmpty()) return
+                      found.forEach { CodeInbox.add(it.first, it.second) }
+                      if (KbSettings.codeNotify(this)) postCopyNotification(found[0].first, found[0].second)
+                  } catch (e: Exception) {
+                      // خطا در یک اعلان نباید سرویس را از کار بیندازد
+                  }
+              }
+
+              private fun postCopyNotification(value: String, kind: String) {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel(CopyReceiver.CHANNEL, "کپی سریع کد و شماره", NotificationManager.IMPORTANCE_HIGH)
+                      )
+                  }
+                  val id = value.hashCode()
+                  val intent = Intent(this, CopyReceiver::class.java)
+                      .putExtra("v", value).putExtra("k", kind).putExtra("id", id)
+                  val pi = PendingIntent.getBroadcast(
+                      this, id, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CopyReceiver.CHANNEL)
+                  else @Suppress("DEPRECATION") Notification.Builder(this).setPriority(Notification.PRIORITY_HIGH)
+                  b.setSmallIcon(android.R.drawable.ic_menu_edit)
+                      .setContentTitle("$kind: $value")
+                      .setContentText("ضربه بزن تا کپی شود")
+                      .setContentIntent(pi)
+                      .setAutoCancel(true)
+                      .setOnlyAlertOnce(true)
+                  if (Build.VERSION.SDK_INT >= 26) b.setTimeoutAfter(2 * 60 * 1000L)
+                  try { nm.notify(id, b.build()) } catch (e: Exception) { }
+              }
+          }
+
+          /** با ضربه روی اعلان، مقدار در کلیپ‌بورد قرار می‌گیرد. */
+          class CopyReceiver : BroadcastReceiver() {
+              companion object { const val CHANNEL = "codes" }
+
+              override fun onReceive(context: Context, intent: Intent) {
+                  val v = intent.getStringExtra("v") ?: return
+                  val kind = intent.getStringExtra("k").orEmpty()
+                  try {
+                      val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      val clip = ClipData.newPlainText("code", v)
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          // اندروید پیش‌نمایش را مخفی می‌کند و تاریخچه‌ی کیبورد هم آن را ذخیره نمی‌کند
+                          clip.description.extras = PersistableBundle().apply {
+                              putBoolean("android.content.extra.IS_SENSITIVE", true)
+                          }
+                      }
+                      cm.setPrimaryClip(clip)
+                      val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      nm.cancel(intent.getIntExtra("id", 0))
+                      Toast.makeText(context, "✓ $kind کپی شد: $v", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) { }
               }
           }
           KBEOF
