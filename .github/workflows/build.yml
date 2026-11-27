@@ -691,14 +691,24 @@ jobs:
                   private val LONG_DIGITS = Regex("[0-9۰-۹٠-٩]{7,}")
 
                   // چیدمان مثل کیبورد سامسونگ (از چپ به راست)
-                  private val FA_ROWS = listOf("صثقفعهخحجچ", "شسیبلاتنمپ", "طزرودکگ")
+                  private val FA_ROWS = listOf("صثقفعهخحجچ", "شسیبلاتنمپ", "طزردوکگ")
                   private val EN_ROWS = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
 
                   // حروف کم‌کاربرد: با نگه‌داشتن کلید یا با شیفت وارد می‌شوند
-                  private val FA_ALT = mapOf(
-                      'ص' to 'ض', 'ع' to 'غ', 'ی' to 'ئ', 'ا' to 'آ',
-                      'ط' to 'ظ', 'ز' to 'ژ', 'د' to 'ذ', 'و' to 'ؤ', 'گ' to 'ء'
+                  // لایه‌ی شیفت (مثل سامسونگ): حروف کم‌کاربرد و اعراب
+                  private val FA_SHIFT = mapOf(
+                      'ص' to 'ض', 'ث' to '\u064B', 'ع' to 'غ',
+                      'ش' to '\u064E', 'س' to '\u064F', 'ب' to '\u0651', 'ل' to '\u0650', 'ا' to 'آ',
+                      'ط' to 'ظ', 'ز' to 'ژ', 'د' to 'ذ', 'گ' to 'ء'
                   )
+
+                  // با نگه‌داشتن کلید: همان‌ها + «ئ» روی ی و «ؤ» روی و (بدون حرف کوچک روی کلید، مثل سامسونگ)
+                  private val FA_LONG = FA_SHIFT + mapOf('ی' to 'ئ', 'و' to 'ؤ')
+
+                  private const val HARAKAT = "\u064B\u064E\u064F\u0650\u0651"
+
+                  /** اعراب به‌تنهایی دیده نمی‌شوند؛ با کشیده (ـ) نشان داده می‌شوند */
+                  private fun disp(c: Char): String = if (HARAKAT.indexOf(c) >= 0) "\u0640$c" else c.toString()
 
                   // دسته‌های ایموجی (آیکون تب، فهرست ایموجی‌ها با فاصله از هم جدا شده)
                   private val EMOJI_CATS = listOf(
@@ -829,8 +839,8 @@ jobs:
 
                   // ردیف سوم: شیفت + حروف + پاک‌کردن (با نگه‌داشتن، تکرار می‌شود)
                   val r3 = newRow(52)
-                  val shiftKey = key(if (shift) "⬆" else "⇧", 20f, true) { shift = !shift; showLetters() }
-                  if (shift) shiftKey.background = keyBg(0xFF90A4AE.toInt(), cPressed)
+                  val shiftKey = key("⇧", 22f, true) { shift = !shift; showLetters() }
+                  if (shift) shiftKey.setTextColor(0xFF2F6BFF.toInt())
                   r3.addView(shiftKey, weight(1.5f))
                   rows[2].forEach { r3.addView(letterKey(it), weight(1f)) }
                   r3.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
@@ -838,14 +848,15 @@ jobs:
 
                   // ردیف پایین
                   val b = newRow(52)
-                  b.addView(key("123", 15f, true) { showNumbers() }, weight(1.3f))
+                  b.addView(key("!#1", 15f, true) { showSymbols(1) }, weight(1.3f))
+                  b.addView(key("123", 14f, true) { showNumbers() }, weight(1.2f))
                   b.addView(key("🌐", 18f, true) {
                       lang = if (fa) "en" else "fa"
                       shift = false
                       showLetters()
                   }, weight(1.1f))
                   b.addView(keyWithAlt(if (fa) "،" else ",", "!", 20f) { type(if (fa) "،" else ",") }, weight(1f))
-                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(4.6f))
+                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(3.4f))
                   b.addView(keyWithAlt(".", if (fa) "؟" else "?", 20f) { type(".") }, weight(1f))
                   b.addView(key("↵", 20f, true) { enter() }, weight(1.5f))
                   keysArea.addView(b)
@@ -860,15 +871,20 @@ jobs:
               }
 
               private fun letterKey(base: Char): View {
-                  val alt = if (fa) FA_ALT[base] else null
                   val shown: Char = when {
                       !fa -> if (shift) base.uppercaseChar() else base
-                      shift && alt != null -> alt
+                      shift -> FA_SHIFT[base] ?: base
                       else -> base
                   }
-                  // اگر شیفت روشن است، دیگر حرف جایگزین جداگانه نشان داده نمی‌شود
-                  val hint = if (alt != null && !shift) alt.toString() else null
-                  val v = keyWithAlt(shown.toString(), hint, 20f) {
+                  val longChar: Char? = if (fa) FA_LONG[base] else null
+                  // حرف کوچک گوشه‌ی کلید: در حالت عادی همان حرف/اعراب لایه‌ی شیفت؛ در لایه‌ی شیفت فقط «ئ» روی «ی»
+                  val hintChar: Char? = when {
+                      !fa -> null
+                      base == 'و' -> null
+                      shift -> if (base == 'ی') 'ئ' else null
+                      else -> longChar
+                  }
+                  val v = keyWithAlt(disp(shown), hintChar?.let { disp(it) }, 20f, longChar?.toString()) {
                       type(shown.toString())
                       if (shift) { shift = false; showLetters() }
                   }
@@ -877,16 +893,18 @@ jobs:
               }
 
               /** کلید با حرف جایگزین: نگه‌داشتن کلید، حرف کوچک گوشه‌ی کلید را وارد می‌کند. */
-              private fun keyWithAlt(label: String, alt: String?, size: Float, onClick: () -> Unit): View {
+              private fun keyWithAlt(
+                  label: String, hint: String?, size: Float, longPress: String? = hint, onClick: () -> Unit
+              ): View {
                   val btn = key(label, size, false, onClick)
-                  if (alt == null) return btn
-                  btn.setOnLongClickListener { type(alt); true }
+                  if (longPress != null) btn.setOnLongClickListener { type(longPress); true }
+                  if (hint == null) return btn
                   val frame = FrameLayout(this)
                   frame.addView(btn, FrameLayout.LayoutParams(
                       FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
                   ))
                   frame.addView(TextView(this).apply {
-                      text = alt
+                      text = hint
                       textSize = 10f
                       setTextColor(cHint)
                   }, FrameLayout.LayoutParams(
@@ -920,8 +938,8 @@ jobs:
 
                   val last = newRow(h)
                   last.addView(key(if (fa) "ابج" else "ABC", 18f, true) { showLetters() }, weight(1f))
-                  last.addView(key(comma, ts) { type(comma) }, weight(1f))
                   last.addView(key(d[9].toString(), ts) { type(d[9].toString()) }, weight(1f))
+                  last.addView(key(comma, ts) { type(comma) }, weight(1f))
                   last.addView(key(".", ts) { type(".") }, weight(1f))
                   keysArea.addView(last)
               }
@@ -1350,6 +1368,56 @@ jobs:
               private fun resetKeys(swipe: Boolean) {
                   keysArea.removeAllViews()
                   keysArea.swipeEnabled = swipe
+              }
+
+              // ---- صفحه‌ی نمادها (!#1) مثل سامسونگ؛ دو صفحه: 1/2 و 2/2 ----
+              private fun showSymbols(page: Int) {
+                  resetKeys(false)
+                  val rowB: List<String>
+                  val rowC: List<String>
+                  val rowD: List<String>
+                  if (page == 1) {
+                      rowB = listOf("+", "×", "÷", "=", "/", "_", "<", ">", "[", "]")
+                      rowC = listOf("!", "@", "#", "﷼", "%", "^", "&", "*", "(", ")")
+                      rowD = listOf("-", "'", "\"", ":", "؛", "،", "؟")
+                  } else {
+                      rowB = listOf("`", "~", "\\", "|", "{", "}", "€", "£", "¥", "$")
+                      rowC = listOf("°", "•", "○", "●", "□", "■", "♤", "♡", "◇", "♧")
+                      rowD = listOf("☆", "▪", "¤", "《", "》", "¡", "¿")
+                  }
+
+                  fun symRow(items: List<String>): LinearLayout {
+                      val line = newRow(52)
+                      items.forEach { c -> line.addView(key(c, 20f) { type(c) }, weight(1f)) }
+                      return line
+                  }
+
+                  // ردیف اعداد (همیشه لاتین)
+                  keysArea.addView(symRow("1234567890".map { it.toString() }))
+                  keysArea.addView(symRow(rowB))
+                  keysArea.addView(symRow(rowC))
+
+                  val r4 = newRow(52)
+                  r4.addView(
+                      key(if (page == 1) "1/2" else "2/2", 18f, true) { showSymbols(if (page == 1) 2 else 1) },
+                      weight(1.5f)
+                  )
+                  rowD.forEach { c -> r4.addView(key(c, 20f) { type(c) }, weight(1f)) }
+                  r4.addView(repeatKey("⌫", 20f) { backspace() }, weight(1.5f))
+                  keysArea.addView(r4)
+
+                  val b = newRow(52)
+                  b.addView(key(if (fa) "اب" else "ABC", 16f, true) { showLetters(); updateSuggestions() }, weight(1.3f))
+                  b.addView(key("🌐", 18f, true) {
+                      lang = if (fa) "en" else "fa"
+                      shift = false
+                      showSymbols(page)
+                  }, weight(1.1f))
+                  b.addView(key(if (fa) "،" else ",", 20f) { type(if (fa) "،" else ",") }, weight(1f))
+                  b.addView(key(if (fa) "فارسی" else "English", 15f) { type(" ") }, weight(4.6f))
+                  b.addView(key(".", 20f) { type(".") }, weight(1f))
+                  b.addView(key("↵", 20f, true) { enter() }, weight(1.5f))
+                  keysArea.addView(b)
               }
 
               // ---- ابزارهای UI ----
